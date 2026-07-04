@@ -1,12 +1,18 @@
 /**
- * @file HTMLRewriter environment adapter.
+ * @file HTMLRewriter adapter for Node.js — backed by html-rewriter-wasm.
  *
- * On Cloudflare Workers `globalThis.HTMLRewriter` is available natively.
- * On Node.js the same API is provided by `html-rewriter-wasm`.
+ * The wasm build is pure CommonJS, but Node's cjs-module-lexer exposes
+ * `HTMLRewriter` as a named ESM export, and WASM initialisation runs
+ * synchronously at module load — so a static import works without an async
+ * init wrapper. This file is reached only via the Node/default package entry;
+ * the Workers entry never imports it, so html-rewriter-wasm is excluded from
+ * Workers bundles.
  *
  * The adapter exposes a single async `runRewriter(html, handlers)` that
  * drives parsing and lets registered handlers run their side effects.
  */
+
+import { HTMLRewriter } from 'html-rewriter-wasm';
 
 /**
  * @typedef {{
@@ -25,19 +31,6 @@
  * @returns {Promise<void>}
  */
 export async function runRewriter(html, handlers) {
-    const NativeHTMLRewriter =
-        typeof globalThis.HTMLRewriter === 'function' ? globalThis.HTMLRewriter : null;
-
-    if (NativeHTMLRewriter) {
-        const rw = new NativeHTMLRewriter();
-        for (const [selector, h] of Object.entries(handlers)) rw.on(selector, h);
-        const resp = rw.transform(new Response(html));
-        // Drain the response so the pipeline runs to completion.
-        await resp.arrayBuffer();
-        return;
-    }
-
-    const { HTMLRewriter } = await import('html-rewriter-wasm');
     const rw = new HTMLRewriter(() => {
         // Discard output chunks.
     });
