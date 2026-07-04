@@ -1,0 +1,42 @@
+name: release
+
+# Triggered by pushing a version tag (e.g. v0.2.0).
+# The repository's package.json is kept at 0.0.0-dev; the version is injected
+# from the tag at publish time and never committed back to the repository.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Set version from tag (no commit)
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+
+      - run: npm run check
+      - run: npm test
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME" --target "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
