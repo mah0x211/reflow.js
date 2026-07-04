@@ -139,6 +139,8 @@ class Reflow {
 
 ## Usage with Cloudflare Workers
 
+The package selects a Workers-specific entry automatically via the `workerd` export condition. When bundled with Wrangler (or esbuild run with `--conditions=workerd`), `html-rewriter-wasm` is excluded from the Worker bundle — the native `HTMLRewriter` global is used instead. No special import is needed; the public API is identical on both runtimes.
+
 ```js
 import { Reflow } from '@mah0x211/reflow';
 import layoutHtml from './views/layout.html?raw';

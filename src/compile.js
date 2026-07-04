@@ -8,7 +8,6 @@
 
 import { ReflowCompileError } from './errors.js';
 import { scanElementRanges } from './scanner.js';
-import { runRewriter } from './htmlrewriter.js';
 import { makeRoot, makeElement, makeText, makeComment, makeChain, isIgnorableForAdjacency } from './ir.js';
 import {
     parseData,
@@ -21,6 +20,30 @@ import {
 } from './directives/parsers.js';
 import { collectHelperNames } from './expr/evaluate.js';
 import { makeSnippet, offsetToLineCol } from './snippet.js';
+
+/**
+ * Runtime-specific HTMLRewriter adapter. The active implementation is
+ * installed once as a module side-effect by the package entry point
+ * (`src/index.js` for Node, `src/index.workers.js` for Cloudflare Workers).
+ * Until then this throwing stub makes any premature compile call fail loudly.
+ *
+ * @type {(html: string, handlers: Record<string, any>) => Promise<void>}
+ */
+let runRewriter = async (_html, _handlers) => {
+    throw new Error(
+        'reflow: HTMLRewriter adapter not initialized; ' +
+        'import Reflow via the package entry point (this is set automatically)'
+    );
+};
+
+/**
+ * Install the runtime-specific HTMLRewriter adapter.
+ *
+ * @param {(html: string, handlers: Record<string, any>) => Promise<void>} fn
+ */
+export function setRewriter(fn) {
+    runRewriter = fn;
+}
 
 /**
  * HTML5 void elements — never accept children or a closing tag.

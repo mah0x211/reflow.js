@@ -8,7 +8,9 @@
     "exports": {
         ".": {
             "types": "./dist/index.d.ts",
-            "import": "./src/index.js"
+            "workerd": "./src/index.workers.js",
+            "node": "./src/index.js",
+            "default": "./src/index.js"
         }
     },
     "files": [
@@ -19,18 +21,18 @@
     ],
     "scripts": {
         "test": "node --test 'test/**/*.test.js'",
-        "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=html --include='src/**/*.js' --exclude='src/htmlrewriter.js' node --test 'test/**/*.test.js'",
+        "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=html --include='src/**/*.js' --exclude='src/htmlrewriter.node.js' --exclude='src/htmlrewriter.workers.js' --exclude='src/index.workers.js' node --test 'test/**/*.test.js'",
         "check": "tsc -p jsconfig.json",
-        "build:types": "tsc -p tsconfig.build.json",
+        "build:types": "rm -rf dist && tsc -p tsconfig.build.json",
         "prepublishOnly": "npm run build:types",
         "bench": "node bench/index.js"
     },
     "dependencies": {
+        "html-rewriter-wasm": "^0.4.1",
         "json5": "^2.2.3"
     },
     "devDependencies": {
         "c8": "^11.0.0",
-        "html-rewriter-wasm": "^0.4.1",
         "mitata": "^1.0.34",
         "typescript": "^5.5.0"
     },
