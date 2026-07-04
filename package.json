@@ -1,0 +1,42 @@
+{
+    "name": "@mah0x211/reflow",
+    "version": "0.0.0-dev",
+    "description": "An attribute-based HTML template engine that renders declarative HTML attributes into HTML.",
+    "type": "module",
+    "main": "./src/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./src/index.js"
+        }
+    },
+    "files": [
+        "src",
+        "dist",
+        "README.md",
+        "LICENSE"
+    ],
+    "scripts": {
+        "test": "node --test 'test/**/*.test.js'",
+        "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=html --include='src/**/*.js' --exclude='src/htmlrewriter.js' node --test 'test/**/*.test.js'",
+        "check": "tsc -p jsconfig.json",
+        "build:types": "tsc -p tsconfig.build.json",
+        "prepublishOnly": "npm run build:types",
+        "bench": "node bench/index.js"
+    },
+    "dependencies": {
+        "json5": "^2.2.3"
+    },
+    "devDependencies": {
+        "c8": "^11.0.0",
+        "html-rewriter-wasm": "^0.4.1",
+        "typescript": "^5.5.0"
+    },
+    "engines": {
+        "node": ">=24"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}
