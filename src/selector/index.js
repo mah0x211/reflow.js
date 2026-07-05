@@ -164,7 +164,7 @@ function pushBucket(bucket, key, el) {
  *     this branch was chosen);
  *   - it is an x-match case/nocase (the parent x-match's cases must be
  *     evaluated to confirm this branch was chosen);
- *   - it declares x-data (scope frame push);
+ *   - it declares x-data or x-with (scope frame push);
  *   - it declares x-for or x-each (loop iteration).
  *
  * Other ancestors add nothing structural and can be skipped by the targeted
@@ -193,6 +193,7 @@ export function elementRequiresExecution(el) {
     if (el.chainBranch) return true;
     if (el.matchBranch) return true;
     if (el.directives.data) return true;
+    if (el.directives.with) return true;
     if (el.directives.for) return true;
     if (el.directives.each) return true;
     return false;
