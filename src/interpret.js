@@ -5,14 +5,20 @@
  * documented on its handler below (renderChain, renderElement,
  * renderElementOnce, resolveBindValue, emitTextContent, emitHtmlContent,
  * emitIncludeContent, postEmitBreakOrThrow).
+ *
+ * `renderFragment` (bottom of file) is the entry point for CSS-selector
+ * fragment extraction. It reuses the same primitives but drives the walk
+ * from resolved candidate elements rather than from the template root.
  */
 
-import { ReflowRuntimeError, ReflowIncludeError } from './errors.js';
+import { ReflowRuntimeError, ReflowIncludeError, ReflowSelectorError } from './errors.js';
 import { createEnv, pushFrame, popFrame } from './scope.js';
 import { evaluate } from './expr/evaluate.js';
 import { escapeText, escapeAttr } from './escape.js';
 import { makeSnippet, offsetToLineCol } from './snippet.js';
 import { reconstructOpenTag } from './compile.js';
+import { computeControlPath } from './selector/index.js';
+import { resolveSelector, evalPositional } from './selector/resolve.js';
 
 /**
  * HTML5 void elements — never have a closing tag.
@@ -608,4 +614,763 @@ function describeValue(v) {
     if (Array.isArray(v)) return 'array';
     const t = typeof v;
     return t === 'object' ? 'object' : t;
+}
+
+// -------------------------------------------------------------------------
+// Selector fragment rendering
+// -------------------------------------------------------------------------
+
+/**
+ * Render only the element(s) matching a CSS selector and return their outer
+ * HTML. Enforces the single-fragment contract: exactly one runtime element
+ * must match, otherwise `ReflowSelectorError` fires with `reason` of
+ * 'no_match' or 'multiple_matches'.
+ *
+ * Strategy:
+ *   1. `resolveSelector` returns candidates in the current template. If the
+ *      selector has no positional pseudo-classes and the candidate has no
+ *      control-flow ancestors nor iteration/scope directives of its own, we
+ *      render it standalone. Otherwise we walk the ancestor `controlPath`
+ *      to reach the candidate's scope and render it there — this handles
+ *      x-data / x-if / x-for / x-each / x-match branching correctly while
+ *      still skipping unrelated subtrees.
+ *   2. If the selector has positional pseudo-classes, we render the
+ *      candidate's parent's direct children with per-emission tracking,
+ *      buffer each candidate emission independently, and confirm the
+ *      matching one(s) once totals are known.
+ *   3. If the current template yielded zero static candidates but has
+ *      x-include-bearing elements, walk to each include, execute it, and
+ *      recurse into the target template with the same selector. Matches
+ *      are accumulated in a shared state so the single-fragment contract
+ *      applies across include boundaries.
+ *
+ * @param {object} params
+ * @param {string} params.name
+ * @param {object} params.compiled
+ * @param {object} params.data
+ * @param {Record<string, Function>} params.helpers
+ * @param {Map<string, object>} params.templates
+ * @param {number} params.maxIncludeDepth
+ * @param {import('./selector/parse.js').CompiledSelector} params.selector
+ * @param {string[]} [params.includeStack]
+ * @returns {string}
+ */
+export function renderFragment({ name, compiled, data, helpers, templates, maxIncludeDepth, selector, includeStack }) {
+    const state = { matches: [], stopAfter: 2 };
+    const env = createEnv(data);
+    const ctx = {
+        name,
+        html: compiled.html,
+        helpers,
+        templates,
+        maxIncludeDepth,
+        includeStack: includeStack ?? [],
+        out: [], // discarded — actual capture happens via candidate buffers
+        selector,
+        selectorState: state,
+        _rootChildren: compiled.root.children,
+    };
+    ctx.includeStack.push(name);
+    try {
+        searchTemplate(compiled, env, ctx);
+    } finally {
+        ctx.includeStack.pop();
+    }
+    return finalizeMatches(state, name, selector);
+}
+
+/**
+ * Search a compiled template for selector matches, appending each into
+ * `ctx.selectorState.matches`. Returns early once we already have enough
+ * matches to know we've exceeded the single-fragment limit.
+ *
+ * @param {object} compiled
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function searchTemplate(compiled, env, ctx) {
+    const state = ctx.selectorState;
+    const candidates = resolveSelector(compiled.index, ctx.selector);
+
+    if (candidates.length > 0) {
+        for (const cand of candidates) {
+            if (state.matches.length >= state.stopAfter) return;
+            renderCandidate(compiled, cand, env, ctx);
+        }
+        return;
+    }
+
+    // Cross-template fallback: only walked when the current template contributed
+    // zero static candidates.
+    if (compiled.index.includes.length === 0) return;
+    for (const includeEl of compiled.index.includes) {
+        if (state.matches.length >= state.stopAfter) return;
+        renderIncludeSearch(compiled, includeEl, env, ctx);
+    }
+}
+
+/**
+ * Materialize a single candidate. Selects the correct rendering path based on
+ * whether positional pseudo-classes must be confirmed against runtime sibling
+ * counts.
+ *
+ * @param {object} compiled
+ * @param {import('./selector/resolve.js').SelectorCandidate} cand
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderCandidate(compiled, cand, env, ctx) {
+    if (cand.positional.length === 0) {
+        renderCandidateDirect(cand.element, env, ctx);
+    } else {
+        renderCandidatePositional(cand.element, cand.positional, env, ctx);
+    }
+}
+
+/**
+ * Render a candidate with no positional constraint: walk to the parent's
+ * scope, verify the target's own branch selection (chain/match), then render
+ * the candidate itself. Each x-each / x-for iteration is treated as an
+ * independent emission and gets its own match entry.
+ *
+ * @param {object} target
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderCandidateDirect(target, env, ctx) {
+    const path = computeControlPath(target);
+    walkControlPath(path, 0, env, ctx, () => {
+        if (!checkOwnBranch(target, env, ctx)) return;
+        renderIterationsCapturing(target, env, ctx);
+    });
+}
+
+/**
+ * If the target is itself a chain branch (x-if / x-elseif / x-else) or an
+ * x-match case, evaluate the enclosing chain / match to confirm this branch
+ * is the one selected at runtime. Returns false when the target's branch is
+ * not selected (candidate is unreachable) and true otherwise.
+ *
+ * @param {object} target
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @returns {boolean}
+ */
+function checkOwnBranch(target, env, ctx) {
+    if (target.chainBranch) {
+        const { chain, branchIndex } = target.chainBranch;
+        for (let i = 0; i < chain.branches.length; i++) {
+            const br = chain.branches[i];
+            const selected = br.cond === null
+                ? true
+                : !!safeEvaluate(br.cond, env, ctx, br.node);
+            if (selected) return i === branchIndex;
+        }
+        return false;
+    }
+    if (target.matchBranch) {
+        const matchEl = target.parent;
+        const matchDir = matchEl.directives.match;
+        const matchValue = safeEvaluate(matchDir.expr, env, ctx, matchEl);
+        for (let i = 0; i < matchDir.branches.length; i++) {
+            const br = matchDir.branches[i];
+            let selected;
+            if (br.cond === null) selected = true;
+            else {
+                const caseValue = safeEvaluate(br.cond, env, ctx, br.node);
+                selected = (matchValue === caseValue);
+            }
+            if (selected) return i === target.matchBranch.branchIndex;
+        }
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Capture each top-level emission of `target` (one for a plain element, N for
+ * x-for / x-each, 1 for x-match / x-include) as a separate match string.
+ *
+ * @param {object} target
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderIterationsCapturing(target, env, ctx) {
+    const d = target.directives;
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+            pushFrame(env, 'loop', { [varName]: i });
+            try {
+                captureEmission(() => renderElementOnce(target, env, ctx), ctx, target);
+            } catch (sig) {
+                if (sig instanceof BreakSignal) {
+                    popFrame(env);
+                    return;
+                }
+                throw sig;
+            }
+            popFrame(env);
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, target);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, target, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+            const frame = { [itemName]: collection[i] };
+            if (indexName) frame[indexName] = i;
+            pushFrame(env, 'loop', frame);
+            try {
+                captureEmission(() => renderElementOnce(target, env, ctx), ctx, target);
+            } catch (sig) {
+                if (sig instanceof BreakSignal) {
+                    popFrame(env);
+                    return;
+                }
+                throw sig;
+            }
+            popFrame(env);
+        }
+        return;
+    }
+
+    // renderElement handles x-match; renderElementOnce handles the rest.
+    // Delegating to renderElement keeps x-match / invisibleMarker handling in
+    // one place, and post-emit break checks stay untouched because breaks are
+    // only valid inside loops (which we handled above).
+    captureEmission(() => renderElement(target, env, ctx), ctx, target);
+}
+
+/**
+ * Render a candidate that carries positional pseudo-class predicates. Walk
+ * to the candidate's parent scope (including the parent's own branch
+ * selection and iteration), then walk the parent's direct children with
+ * per-emission tracking, buffer the candidate's emissions, and confirm
+ * matches once the sibling totals are known.
+ *
+ * @param {object} target
+ * @param {import('./selector/parse.js').PseudoCond[]} positional
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderCandidatePositional(target, positional, env, ctx) {
+    const parent = target.parent;
+    if (!parent) {
+        // Root-level candidate: use the template root's children directly.
+        // Root has no scope / branch / iteration to execute.
+        walkAndTrackChildren(target, positional, null, ctx._rootChildren, env, ctx);
+        return;
+    }
+    const parentPath = computeControlPath(parent);
+    walkControlPath(parentPath, 0, env, ctx, () => {
+        if (!checkOwnBranch(parent, env, ctx)) return;
+        executeParentIterations(parent, target, positional, env, ctx);
+    });
+}
+
+/**
+ * Iterate the parent element's x-for / x-each contexts (each iteration is
+ * an independent parent-render), push x-data if present, and dispatch to
+ * the tracking walker. Handles x-match parents by evaluating the case
+ * selection and treating the chosen case as the parent's single element
+ * child.
+ *
+ * @param {object} parent
+ * @param {object} target
+ * @param {import('./selector/parse.js').PseudoCond[]} positional
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function executeParentIterations(parent, target, positional, env, ctx) {
+    const d = parent.directives ?? {};
+    const state = ctx.selectorState;
+
+    const dispatch = () => {
+        if (d.match) {
+            // x-match: the parent's children were cleared at compile time.
+            // Siblings for positional purposes are the case branches, but at
+            // runtime only the chosen case is emitted (so total = 0 or 1).
+            const matchValue = safeEvaluate(d.match.expr, env, ctx, parent);
+            let selectedNode = null;
+            for (const br of d.match.branches) {
+                if (br.cond === null) { selectedNode = br.node; break; }
+                const caseValue = safeEvaluate(br.cond, env, ctx, br.node);
+                if (matchValue === caseValue) { selectedNode = br.node; break; }
+            }
+            if (!selectedNode) return; // no case matched, no nocase fallback
+            if (selectedNode !== target) return; // some other case is the chosen one
+            walkAndTrackChildren(target, positional, parent, [target], env, ctx);
+            return;
+        }
+        walkAndTrackChildren(target, positional, parent, parent.children, env, ctx);
+    };
+
+    const withData = (fn) => {
+        if (d.data) {
+            pushFrame(env, 'data', d.data.scopes);
+            try { fn(); } finally { popFrame(env); }
+        } else {
+            fn();
+        }
+    };
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            if (state.matches.length >= state.stopAfter) return;
+            pushFrame(env, 'loop', { [varName]: i });
+            try { withData(dispatch); } finally { popFrame(env); }
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, parent);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, parent, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            if (state.matches.length >= state.stopAfter) return;
+            const frame = { [itemName]: collection[i] };
+            if (indexName) frame[indexName] = i;
+            pushFrame(env, 'loop', frame);
+            try { withData(dispatch); } finally { popFrame(env); }
+        }
+        return;
+    }
+
+    withData(dispatch);
+}
+
+/**
+ * Walk `siblings` (a parent element's direct children after chain
+ * consolidation) with per-emission position tracking. Whenever an emission
+ * corresponds to `target`, capture its output into a buffer. At the end,
+ * evaluate positional predicates against the collected sibling counts and
+ * push matching outputs onto `ctx.selectorState.matches`.
+ *
+ * @param {object} target
+ * @param {import('./selector/parse.js').PseudoCond[]} positional
+ * @param {object | null} ownerNode          The parent element (unused, kept
+ *                                            for future error context).
+ * @param {object[]} siblings
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function walkAndTrackChildren(target, positional, ownerNode, siblings, env, ctx) {
+    void ownerNode;
+    const frame = {
+        total: 0,
+        byTag: new Map(),
+        emissions: [],     // { buffer: string, index: number, ofTypeIndex: number, tag: string }
+    };
+
+    for (const child of siblings) {
+        trackChildEmissions(child, target, env, ctx, frame);
+        if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+    }
+
+    // Now that totals are known, evaluate predicates on each candidate emission.
+    for (const em of frame.emissions) {
+        const pos = {
+            index: em.index,
+            total: frame.total,
+            ofTypeIndex: em.ofTypeIndex,
+            ofTypeTotal: frame.byTag.get(em.tag) ?? 0,
+        };
+        if (positional.every(p => evalPositional(p, pos))) {
+            ctx.selectorState.matches.push({ templateName: ctx.name, output: em.buffer });
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+        }
+    }
+}
+
+/**
+ * Walk a single child node of a tracked parent, incrementing emission
+ * counters and buffering the target's emissions.
+ *
+ * @param {object} child
+ * @param {object} target
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {{ total: number, byTag: Map<string, number>, emissions: Array<{ buffer: string, index: number, ofTypeIndex: number, tag: string }> }} frame
+ */
+function trackChildEmissions(child, target, env, ctx, frame) {
+    if (child.type === 'text' || child.type === 'comment') return;
+
+    if (child.type === 'chain') {
+        // Evaluate branches; at most one emits.
+        for (const branch of child.branches) {
+            let selected = false;
+            if (branch.cond === null) selected = true;
+            else selected = !!safeEvaluate(branch.cond, env, ctx, branch.node);
+            if (selected) {
+                trackElementEmission(branch.node, target, env, ctx, frame);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (child.type === 'element') {
+        trackElementEmission(child, target, env, ctx, frame);
+        return;
+    }
+}
+
+/**
+ * Emit a single element that participates in position tracking. Handles
+ * x-for / x-each iteration (each iteration = 1 emission) and everything
+ * else (1 emission). When the element is the sought target we capture the
+ * emission into a buffer for later predicate evaluation.
+ *
+ * @param {object} el
+ * @param {object} target
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {{ total: number, byTag: Map<string, number>, emissions: any[] }} frame
+ */
+function trackElementEmission(el, target, env, ctx, frame) {
+    if (el.invisibleMarker) return;
+    const d = el.directives;
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            pushFrame(env, 'loop', { [varName]: i });
+            try {
+                recordEmission(el, target, frame, ctx, () => renderElementOnce(el, env, ctx));
+            } catch (sig) {
+                if (sig instanceof BreakSignal) {
+                    popFrame(env);
+                    return;
+                }
+                throw sig;
+            }
+            popFrame(env);
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, el);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, el, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            const frameVars = { [itemName]: collection[i] };
+            if (indexName) frameVars[indexName] = i;
+            pushFrame(env, 'loop', frameVars);
+            try {
+                recordEmission(el, target, frame, ctx, () => renderElementOnce(el, env, ctx));
+            } catch (sig) {
+                if (sig instanceof BreakSignal) {
+                    popFrame(env);
+                    return;
+                }
+                throw sig;
+            }
+            popFrame(env);
+        }
+        return;
+    }
+    // Non-iteration path — delegate to renderElement so x-match is handled once.
+    recordEmission(el, target, frame, ctx, () => renderElement(el, env, ctx));
+}
+
+/**
+ * Emit `el` via `emit()` while recording its runtime position in `frame`.
+ * If `el === target`, capture the emission's bytes into a buffer; otherwise
+ * discard them but still count the emission.
+ *
+ * @param {object} el
+ * @param {object} target
+ * @param {{ total: number, byTag: Map<string, number>, emissions: any[] }} frame
+ * @param {object} ctx
+ * @param {() => void} emit
+ */
+function recordEmission(el, target, frame, ctx, emit) {
+    frame.total += 1;
+    const tag = el.tagName;
+    const nextOfType = (frame.byTag.get(tag) ?? 0) + 1;
+    frame.byTag.set(tag, nextOfType);
+
+    if (el !== target) {
+        // Not the target — discard bytes but drive the walker so nested
+        // candidates (unlikely with single-fragment contract, but possible
+        // if an ancestor is included in a broader search) still register.
+        const savedOut = ctx.out;
+        ctx.out = [];
+        try { emit(); } finally { ctx.out = savedOut; }
+        return;
+    }
+
+    // Capture into a fresh buffer so we can preserve the emission independent
+    // of the outer discard sink.
+    const savedOut = ctx.out;
+    const buf = [];
+    ctx.out = buf;
+    try { emit(); } finally { ctx.out = savedOut; }
+    frame.emissions.push({
+        buffer: buf.join(''),
+        index: frame.total,
+        ofTypeIndex: nextOfType,
+        tag,
+    });
+}
+
+/**
+ * Run `emit()`, capturing everything written to `ctx.out` into a new buffer.
+ * Push the captured string onto `ctx.selectorState.matches` as a confirmed
+ * match. Used by the direct (non-positional) candidate path where the
+ * candidate itself is unconditionally the target.
+ *
+ * @param {() => void} emit
+ * @param {object} ctx
+ * @param {object} target
+ */
+function captureEmission(emit, ctx, target) {
+    void target;
+    const savedOut = ctx.out;
+    const buf = [];
+    ctx.out = buf;
+    try {
+        emit();
+    } finally {
+        ctx.out = savedOut;
+    }
+    ctx.selectorState.matches.push({ templateName: ctx.name, output: buf.join('') });
+}
+
+/**
+ * Walk a target's controlPath from root toward leaf, executing scope
+ * pushes and iteration for each control-flow ancestor. `cont` is invoked
+ * from within the accumulated scope so the caller can render the target
+ * (or track its parent's siblings).
+ *
+ * @param {object[]} path
+ * @param {number} pathIndex
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {() => void} cont
+ */
+function walkControlPath(path, pathIndex, env, ctx, cont) {
+    if (pathIndex >= path.length) {
+        cont();
+        return;
+    }
+    const step = path[pathIndex];
+    stepControlFlow(step, env, ctx, () => walkControlPath(path, pathIndex + 1, env, ctx, cont));
+}
+
+/**
+ * Handle a single controlPath step: evaluate chain/match branch selection,
+ * iterate x-for/x-each, and push x-data. Invokes `cont` inside the resulting
+ * scope. Returns without calling `cont` when the step's branch is not the
+ * one leading to the target.
+ *
+ * @param {object} step
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {() => void} cont
+ */
+function stepControlFlow(step, env, ctx, cont) {
+    // 1. Branch selection — chain / match. Skip step (and abort) when the
+    //    target's branch is not the chosen one.
+    if (step.chainBranch) {
+        const { chain, branchIndex } = step.chainBranch;
+        let chosen = -1;
+        for (let i = 0; i < chain.branches.length; i++) {
+            const br = chain.branches[i];
+            let selected;
+            if (br.cond === null) selected = true;
+            else selected = !!safeEvaluate(br.cond, env, ctx, br.node);
+            if (selected) { chosen = i; break; }
+        }
+        if (chosen !== branchIndex) return;
+    }
+    if (step.matchBranch) {
+        const matchEl = step.parent;
+        const matchDir = matchEl.directives.match;
+        const matchValue = safeEvaluate(matchDir.expr, env, ctx, matchEl);
+        const wantIndex = step.matchBranch.branchIndex;
+        let chosen = -1;
+        for (let i = 0; i < matchDir.branches.length; i++) {
+            const br = matchDir.branches[i];
+            let selected;
+            if (br.cond === null) selected = true;
+            else {
+                const caseValue = safeEvaluate(br.cond, env, ctx, br.node);
+                selected = (matchValue === caseValue);
+            }
+            if (selected) { chosen = i; break; }
+        }
+        if (chosen !== wantIndex) return;
+    }
+
+    // 2. Iteration on the step element itself.
+    const d = step.directives;
+    const withData = (fn) => {
+        if (d.data) {
+            pushFrame(env, 'data', d.data.scopes);
+            try { fn(); } finally { popFrame(env); }
+        } else {
+            fn();
+        }
+    };
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+            pushFrame(env, 'loop', { [varName]: i });
+            try { withData(cont); } finally { popFrame(env); }
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, step);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, step, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+            const frame = { [itemName]: collection[i] };
+            if (indexName) frame[indexName] = i;
+            pushFrame(env, 'loop', frame);
+            try { withData(cont); } finally { popFrame(env); }
+        }
+        return;
+    }
+
+    withData(cont);
+}
+
+/**
+ * Walk to an include element, execute it (evaluate expression, run include
+ * safety checks, look up the target template) and recurse into the target
+ * template's selector search.
+ *
+ * @param {object} compiled
+ * @param {object} includeEl
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderIncludeSearch(compiled, includeEl, env, ctx) {
+    void compiled;
+    const path = computeControlPath(includeEl);
+    walkControlPath(path, 0, env, ctx, () => {
+        executeIncludeSearch(includeEl, env, ctx);
+    });
+}
+
+/**
+ * At an include element: evaluate the target template name, run the same
+ * safety checks as emitIncludeContent, and recurse `searchTemplate` on the
+ * target with the current selector.
+ *
+ * @param {object} includeEl
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function executeIncludeSearch(includeEl, env, ctx) {
+    const d = includeEl.directives;
+    const value = safeEvaluate(d.include.expr, env, ctx, includeEl);
+    if (typeof value !== 'string') {
+        throw makeIncludeError(
+            `x-include: value must evaluate to a template name (string), got ${describeValue(value)}`,
+            ctx, includeEl, { reason: 'invalid', requested: value }
+        );
+    }
+    const target = ctx.templates.get(value);
+    if (!target) {
+        throw makeIncludeError(
+            `template not found: "${value}"`,
+            ctx, includeEl, { reason: 'not_found', requested: value }
+        );
+    }
+    if (ctx.includeStack.length >= ctx.maxIncludeDepth) {
+        throw makeIncludeError(
+            `include depth limit exceeded (${ctx.maxIncludeDepth})`,
+            ctx, includeEl, { reason: 'depth_exceeded', requested: value }
+        );
+    }
+    if (ctx.includeStack.includes(value)) {
+        throw makeIncludeError(
+            `include cycle detected`,
+            ctx, includeEl, { reason: 'cycle', requested: value }
+        );
+    }
+
+    // Recurse with the same selector state, fresh lexical scope, same globals.
+    const nestedEnv = createEnv(env.globals);
+    const nestedCtx = {
+        ...ctx,
+        name: value,
+        html: target.html,
+        _rootChildren: target.root.children,
+    };
+    ctx.includeStack.push(value);
+    try {
+        searchTemplate(target, nestedEnv, nestedCtx);
+    } finally {
+        ctx.includeStack.pop();
+    }
+}
+
+/**
+ * Finalize match collection: enforce the single-fragment contract.
+ *
+ * @param {{ matches: Array<{ templateName: string, output: string }> }} state
+ * @param {string} entryTemplateName
+ * @param {import('./selector/parse.js').CompiledSelector} selector
+ * @returns {string}
+ */
+function finalizeMatches(state, entryTemplateName, selector) {
+    if (state.matches.length === 0) {
+        throw new ReflowSelectorError(
+            `selector "${selector.source}" matched no elements in template "${entryTemplateName}"`,
+            {
+                reason: 'no_match',
+                templateName: entryTemplateName,
+                source: selector.source,
+            }
+        );
+    }
+    if (state.matches.length > 1) {
+        throw new ReflowSelectorError(
+            `selector "${selector.source}" matched ${state.matches.length}${state.matches.length >= 2 ? '+' : ''} elements; the single-fragment contract requires exactly one`,
+            {
+                reason: 'multiple_matches',
+                templateName: entryTemplateName,
+                source: selector.source,
+                matches: state.matches.map(m => ({ templateName: m.templateName })),
+            }
+        );
+    }
+    return state.matches[0].output;
 }

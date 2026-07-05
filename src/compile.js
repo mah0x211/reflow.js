@@ -20,6 +20,7 @@ import {
 } from './directives/parsers.js';
 import { collectHelperNames } from './expr/evaluate.js';
 import { makeSnippet, offsetToLineCol } from './snippet.js';
+import { buildTemplateIndex } from './selector/index.js';
 
 /**
  * Runtime-specific HTMLRewriter adapter. The active implementation is
@@ -84,7 +85,7 @@ const VOID_ELEMENTS = new Set([
  * @param {string} params.html       Template HTML source.
  * @param {string} params.prefix     Directive prefix (e.g. 'x-').
  * @param {Set<string>} params.helperNames  Registered helper identifiers.
- * @returns {Promise<{ root: object, html: string }>}
+ * @returns {Promise<{ root: object, html: string, index: import('./selector/index.js').TemplateIndex }>}
  */
 export async function compileTemplate({ name, html, prefix, helperNames }) {
     const ranges = scanElementRanges(html);
@@ -190,7 +191,12 @@ export async function compileTemplate({ name, html, prefix, helperNames }) {
     // Global validation pass: verify x-break / x-break-if occur only within a loop.
     validateBreakContext(root, html, name, /*inLoop=*/false);
 
-    return { root, html };
+    // Build the selector index, which also annotates element nodes with
+    // parent/depth/chainBranch/matchBranch/order back-pointers used at
+    // both selector-resolve time and render time.
+    const index = buildTemplateIndex(root);
+
+    return { root, html, index };
 }
 
 /**

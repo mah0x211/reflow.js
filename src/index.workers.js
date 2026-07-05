@@ -19,4 +19,5 @@ export {
     ReflowCompileError,
     ReflowRuntimeError,
     ReflowIncludeError,
+    ReflowSelectorError,
 } from './errors.js';

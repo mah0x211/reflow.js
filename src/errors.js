@@ -88,3 +88,24 @@ export class ReflowIncludeError extends ReflowError {
         this.name = 'ReflowIncludeError';
     }
 }
+
+/**
+ * Thrown for CSS-selector-related failures, identified by `reason`:
+ * 'syntax' (malformed selector — carries `source` and `position`),
+ * 'unsupported' (a valid CSS construct that reflow intentionally does not
+ * accept — carries `source` and `feature`), 'multiple_matches' (the selector
+ * resolved to more than one runtime element — carries `templateName` and
+ * `matches`), or 'no_match' (the selector resolved to zero elements — carries
+ * `templateName` and `source`). Selector features are static-only and the
+ * single-fragment contract enforces exactly one runtime match.
+ */
+export class ReflowSelectorError extends ReflowError {
+    /**
+     * @param {string} message
+     * @param {object} [meta]
+     */
+    constructor(message, meta = {}) {
+        super(message, meta);
+        this.name = 'ReflowSelectorError';
+    }
+}
