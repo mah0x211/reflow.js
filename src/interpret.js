@@ -723,7 +723,374 @@ function renderCandidate(compiled, cand, env, ctx) {
     if (cand.positional.length === 0) {
         renderCandidateDirect(cand.element, env, ctx);
     } else {
-        renderCandidatePositional(cand.element, cand.positional, env, ctx);
+        // Positional candidates are handled in batched form by
+        // renderPositionalGroups so a shared parent walks its children only
+        // once regardless of how many candidates share it.
+        renderPositionalGroups([cand], env, ctx);
+    }
+}
+
+/**
+ * Batched positional-candidate renderer. All candidates in `group` are
+ * confirmed within a single walk per parent, and each parent's siblings are
+ * counted (not fully rendered) unless they are the target of one of the
+ * candidates. Early termination applies when every predicate is
+ * position-known-forward (no `:last-*`, `:nth-last-*`, `:only-*` in play).
+ *
+ * @param {import('./selector/resolve.js').SelectorCandidate[]} group
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function renderPositionalGroups(group, env, ctx) {
+    // Group candidates by their parent (or null for root-level candidates).
+    /** @type {Map<object | null, import('./selector/resolve.js').SelectorCandidate[]>} */
+    const byParent = new Map();
+    for (const cand of group) {
+        const p = cand.element.parent ?? null;
+        const list = byParent.get(p);
+        if (list) list.push(cand);
+        else byParent.set(p, [cand]);
+    }
+
+    for (const [parent, candidates] of byParent) {
+        if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+        if (parent === null) {
+            walkAndTrackChildrenBatched(candidates, /*ownerNode=*/null, ctx._rootChildren, env, ctx);
+            continue;
+        }
+        const parentPath = computeControlPath(parent);
+        walkControlPath(parentPath, 0, env, ctx, () => {
+            if (!checkOwnBranch(parent, env, ctx)) return;
+            executeParentIterationsBatched(parent, candidates, env, ctx);
+        });
+    }
+}
+
+/**
+ * Iterate the parent's x-for / x-each contexts, push x-data if present, and
+ * dispatch to the tracking walker with the full candidate list. x-match
+ * parents are handled specially — the chosen case is treated as the
+ * parent's sole element child.
+ *
+ * @param {object} parent
+ * @param {import('./selector/resolve.js').SelectorCandidate[]} candidates
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function executeParentIterationsBatched(parent, candidates, env, ctx) {
+    const d = parent.directives ?? {};
+    const state = ctx.selectorState;
+
+    const dispatch = () => {
+        if (d.match) {
+            const matchValue = safeEvaluate(d.match.expr, env, ctx, parent);
+            let selectedNode = null;
+            for (const br of d.match.branches) {
+                if (br.cond === null) { selectedNode = br.node; break; }
+                const caseValue = safeEvaluate(br.cond, env, ctx, br.node);
+                if (matchValue === caseValue) { selectedNode = br.node; break; }
+            }
+            if (!selectedNode) return;
+            walkAndTrackChildrenBatched(candidates, parent, [selectedNode], env, ctx);
+            return;
+        }
+        walkAndTrackChildrenBatched(candidates, parent, parent.children, env, ctx);
+    };
+
+    const withData = (fn) => {
+        if (d.data) {
+            pushFrame(env, 'data', d.data.scopes);
+            try { fn(); } finally { popFrame(env); }
+        } else {
+            fn();
+        }
+    };
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            if (state.matches.length >= state.stopAfter) return;
+            pushFrame(env, 'loop', { [varName]: i });
+            try { withData(dispatch); } finally { popFrame(env); }
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, parent);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, parent, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            if (state.matches.length >= state.stopAfter) return;
+            const frame = { [itemName]: collection[i] };
+            if (indexName) frame[indexName] = i;
+            pushFrame(env, 'loop', frame);
+            try { withData(dispatch); } finally { popFrame(env); }
+        }
+        return;
+    }
+
+    withData(dispatch);
+}
+
+/**
+ * Sentinel used to short-circuit sibling walking once every relevant
+ * position has already been visited (see EarlyTerminate). Not a real error.
+ */
+class EarlyTerminate { }
+
+/**
+ * Walk `siblings` (a parent's post-chain-flattened direct children) with
+ * per-emission position tracking. Only elements that are one of the
+ * `candidates`' targets are fully rendered into a capture buffer; every
+ * other emission is *counted*, not rendered, by consulting the element's
+ * control-flow directives cheaply. When the enabled positional predicates
+ * are all "position-known-forward" (:first-child, :nth-child(n),
+ * :first-of-type, :nth-of-type(n)), the walk terminates as soon as the
+ * required maximum position has been visited.
+ *
+ * @param {import('./selector/resolve.js').SelectorCandidate[]} candidates
+ * @param {object | null} ownerNode
+ * @param {object[]} siblings
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function walkAndTrackChildrenBatched(candidates, ownerNode, siblings, env, ctx) {
+    void ownerNode;
+
+    /** @type {Map<object, import('./selector/resolve.js').SelectorCandidate>} */
+    const candByEl = new Map();
+    for (const c of candidates) candByEl.set(c.element, c);
+
+    // Determine early-termination bound. If every positional predicate is
+    // forward-known (no last-of-type / nth-last / only-* in the group), we
+    // can stop after the maximum required forward position.
+    const term = computeForwardBound(candidates);
+
+    const frame = {
+        total: 0,
+        byTag: new Map(),
+        /** @type {Array<{ candidate: import('./selector/resolve.js').SelectorCandidate, buffer: string, index: number, ofTypeIndex: number, tag: string }>} */
+        emissions: [],
+    };
+
+    try {
+        for (const child of siblings) {
+            processChildForTracking(child, candByEl, term, env, ctx, frame);
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+        }
+    } catch (sig) {
+        if (!(sig instanceof EarlyTerminate)) throw sig;
+    }
+
+    for (const em of frame.emissions) {
+        const pos = {
+            index: em.index,
+            total: frame.total,
+            ofTypeIndex: em.ofTypeIndex,
+            ofTypeTotal: frame.byTag.get(em.tag) ?? 0,
+        };
+        if (em.candidate.positional.every(p => evalPositional(p, pos))) {
+            ctx.selectorState.matches.push({ templateName: ctx.name, output: em.buffer });
+            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
+        }
+    }
+}
+
+/**
+ * @param {import('./selector/resolve.js').SelectorCandidate[]} candidates
+ * @returns {{ requiresTotal: boolean, maxForward: number }}
+ */
+function computeForwardBound(candidates) {
+    let requiresTotal = false;
+    let maxForward = 0;
+    for (const c of candidates) {
+        for (const p of c.positional) {
+            switch (p.name) {
+                case 'first-child':
+                    if (maxForward < 1) maxForward = 1;
+                    break;
+                case 'nth-child':
+                    if (/** @type {number} */(p.n) > maxForward) maxForward = /** @type {number} */(p.n);
+                    break;
+                // Of-type predicates cannot early-terminate on the shared
+                // overall position because their match depends on per-tag
+                // counts we do not know ahead of time; treat as requiring
+                // a full walk.
+                case 'first-of-type':
+                case 'nth-of-type':
+                case 'last-child':
+                case 'last-of-type':
+                case 'nth-last-child':
+                case 'nth-last-of-type':
+                case 'only-child':
+                case 'only-of-type':
+                    requiresTotal = true;
+                    break;
+            }
+        }
+    }
+    return { requiresTotal, maxForward };
+}
+
+/**
+ * Dispatch one child of the tracked parent, threading `frame` counters and
+ * capturing target emissions.
+ *
+ * @param {object} child
+ * @param {Map<object, import('./selector/resolve.js').SelectorCandidate>} candByEl
+ * @param {{ requiresTotal: boolean, maxForward: number }} term
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {object} frame
+ */
+function processChildForTracking(child, candByEl, term, env, ctx, frame) {
+    if (child.type === 'text' || child.type === 'comment') return;
+
+    if (child.type === 'chain') {
+        for (const branch of child.branches) {
+            const selected = branch.cond === null
+                ? true
+                : !!safeEvaluate(branch.cond, env, ctx, branch.node);
+            if (selected) {
+                emitOneOrLoop(branch.node, candByEl, term, env, ctx, frame);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (child.type === 'element') {
+        emitOneOrLoop(child, candByEl, term, env, ctx, frame);
+    }
+}
+
+/**
+ * Emit or count `el`, honoring its iteration directives. Each iteration is
+ * one emission; each emission increments the parent's position counters
+ * and — if the element is a candidate target — fully renders into a capture
+ * buffer.
+ *
+ * @param {object} el
+ * @param {Map<object, import('./selector/resolve.js').SelectorCandidate>} candByEl
+ * @param {{ requiresTotal: boolean, maxForward: number }} term
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {object} frame
+ */
+function emitOneOrLoop(el, candByEl, term, env, ctx, frame) {
+    if (el.invisibleMarker) return;
+    const d = el.directives;
+    const isTarget = candByEl.has(el);
+
+    if (d.for) {
+        const { varName, start, stop, step: stepVal } = d.for;
+        const ascending = stepVal > 0;
+        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
+            if (isTarget) {
+                pushFrame(env, 'loop', { [varName]: i });
+                try {
+                    recordAndMaybeRender(el, candByEl, term, env, ctx, frame, /*renderIt=*/true, /*viaOnce=*/true);
+                } catch (sig) {
+                    if (sig instanceof BreakSignal) {
+                        popFrame(env);
+                        return;
+                    }
+                    throw sig;
+                }
+                popFrame(env);
+            } else {
+                recordAndMaybeRender(el, candByEl, term, env, ctx, frame, /*renderIt=*/false, /*viaOnce=*/true);
+            }
+        }
+        return;
+    }
+    if (d.each) {
+        const collection = safeEvaluate(d.each.collection, env, ctx, el);
+        if (!Array.isArray(collection)) {
+            throw makeRuntimeError(
+                `x-each: expected array, got ${describeValue(collection)}`,
+                ctx, el, { directive: 'x-each' }
+            );
+        }
+        const { itemName, indexName } = d.each;
+        for (let i = 0; i < collection.length; i++) {
+            if (isTarget) {
+                const frameVars = { [itemName]: collection[i] };
+                if (indexName) frameVars[indexName] = i;
+                pushFrame(env, 'loop', frameVars);
+                try {
+                    recordAndMaybeRender(el, candByEl, term, env, ctx, frame, /*renderIt=*/true, /*viaOnce=*/true);
+                } catch (sig) {
+                    if (sig instanceof BreakSignal) {
+                        popFrame(env);
+                        return;
+                    }
+                    throw sig;
+                }
+                popFrame(env);
+            } else {
+                recordAndMaybeRender(el, candByEl, term, env, ctx, frame, /*renderIt=*/false, /*viaOnce=*/true);
+            }
+        }
+        return;
+    }
+
+    recordAndMaybeRender(el, candByEl, term, env, ctx, frame, /*renderIt=*/isTarget, /*viaOnce=*/false);
+}
+
+/**
+ * Increment counters for one emission; when this emission belongs to a
+ * candidate, render its subtree into a buffer and stash the position info.
+ * Throws EarlyTerminate once all forward-required positions have been
+ * visited (and no totals-required predicates are present).
+ *
+ * @param {object} el
+ * @param {Map<object, import('./selector/resolve.js').SelectorCandidate>} candByEl
+ * @param {{ requiresTotal: boolean, maxForward: number }} term
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {object} frame
+ * @param {boolean} renderIt
+ * @param {boolean} viaOnce   True when the caller has already iterated x-for/x-each
+ *                              (so we must call renderElementOnce, not renderElement).
+ */
+function recordAndMaybeRender(el, candByEl, term, env, ctx, frame, renderIt, viaOnce) {
+    frame.total += 1;
+    const tag = el.tagName;
+    const nextOfType = (frame.byTag.get(tag) ?? 0) + 1;
+    frame.byTag.set(tag, nextOfType);
+
+    if (renderIt) {
+        const cand = candByEl.get(el);
+        const savedOut = ctx.out;
+        const buf = [];
+        ctx.out = buf;
+        try {
+            if (viaOnce) renderElementOnce(el, env, ctx);
+            else renderElement(el, env, ctx);
+        } finally {
+            ctx.out = savedOut;
+        }
+        frame.emissions.push({
+            candidate: /** @type {any} */(cand),
+            buffer: buf.join(''),
+            index: frame.total,
+            ofTypeIndex: nextOfType,
+            tag,
+        });
+    }
+
+    // Early termination: once we've walked past the maximum forward position
+    // AND there are no total-requiring predicates in play, further siblings
+    // cannot change any candidate's outcome.
+    if (!term.requiresTotal && term.maxForward > 0 && frame.total >= term.maxForward) {
+        throw new EarlyTerminate();
     }
 }
 
@@ -852,291 +1219,6 @@ function renderIterationsCapturing(target, env, ctx) {
     captureEmission(() => renderElement(target, env, ctx), ctx, target);
 }
 
-/**
- * Render a candidate that carries positional pseudo-class predicates. Walk
- * to the candidate's parent scope (including the parent's own branch
- * selection and iteration), then walk the parent's direct children with
- * per-emission tracking, buffer the candidate's emissions, and confirm
- * matches once the sibling totals are known.
- *
- * @param {object} target
- * @param {import('./selector/parse.js').PseudoCond[]} positional
- * @param {import('./scope.js').Env} env
- * @param {object} ctx
- */
-function renderCandidatePositional(target, positional, env, ctx) {
-    const parent = target.parent;
-    if (!parent) {
-        // Root-level candidate: use the template root's children directly.
-        // Root has no scope / branch / iteration to execute.
-        walkAndTrackChildren(target, positional, null, ctx._rootChildren, env, ctx);
-        return;
-    }
-    const parentPath = computeControlPath(parent);
-    walkControlPath(parentPath, 0, env, ctx, () => {
-        if (!checkOwnBranch(parent, env, ctx)) return;
-        executeParentIterations(parent, target, positional, env, ctx);
-    });
-}
-
-/**
- * Iterate the parent element's x-for / x-each contexts (each iteration is
- * an independent parent-render), push x-data if present, and dispatch to
- * the tracking walker. Handles x-match parents by evaluating the case
- * selection and treating the chosen case as the parent's single element
- * child.
- *
- * @param {object} parent
- * @param {object} target
- * @param {import('./selector/parse.js').PseudoCond[]} positional
- * @param {import('./scope.js').Env} env
- * @param {object} ctx
- */
-function executeParentIterations(parent, target, positional, env, ctx) {
-    const d = parent.directives ?? {};
-    const state = ctx.selectorState;
-
-    const dispatch = () => {
-        if (d.match) {
-            // x-match: the parent's children were cleared at compile time.
-            // Siblings for positional purposes are the case branches, but at
-            // runtime only the chosen case is emitted (so total = 0 or 1).
-            const matchValue = safeEvaluate(d.match.expr, env, ctx, parent);
-            let selectedNode = null;
-            for (const br of d.match.branches) {
-                if (br.cond === null) { selectedNode = br.node; break; }
-                const caseValue = safeEvaluate(br.cond, env, ctx, br.node);
-                if (matchValue === caseValue) { selectedNode = br.node; break; }
-            }
-            if (!selectedNode) return; // no case matched, no nocase fallback
-            if (selectedNode !== target) return; // some other case is the chosen one
-            walkAndTrackChildren(target, positional, parent, [target], env, ctx);
-            return;
-        }
-        walkAndTrackChildren(target, positional, parent, parent.children, env, ctx);
-    };
-
-    const withData = (fn) => {
-        if (d.data) {
-            pushFrame(env, 'data', d.data.scopes);
-            try { fn(); } finally { popFrame(env); }
-        } else {
-            fn();
-        }
-    };
-
-    if (d.for) {
-        const { varName, start, stop, step: stepVal } = d.for;
-        const ascending = stepVal > 0;
-        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
-            if (state.matches.length >= state.stopAfter) return;
-            pushFrame(env, 'loop', { [varName]: i });
-            try { withData(dispatch); } finally { popFrame(env); }
-        }
-        return;
-    }
-    if (d.each) {
-        const collection = safeEvaluate(d.each.collection, env, ctx, parent);
-        if (!Array.isArray(collection)) {
-            throw makeRuntimeError(
-                `x-each: expected array, got ${describeValue(collection)}`,
-                ctx, parent, { directive: 'x-each' }
-            );
-        }
-        const { itemName, indexName } = d.each;
-        for (let i = 0; i < collection.length; i++) {
-            if (state.matches.length >= state.stopAfter) return;
-            const frame = { [itemName]: collection[i] };
-            if (indexName) frame[indexName] = i;
-            pushFrame(env, 'loop', frame);
-            try { withData(dispatch); } finally { popFrame(env); }
-        }
-        return;
-    }
-
-    withData(dispatch);
-}
-
-/**
- * Walk `siblings` (a parent element's direct children after chain
- * consolidation) with per-emission position tracking. Whenever an emission
- * corresponds to `target`, capture its output into a buffer. At the end,
- * evaluate positional predicates against the collected sibling counts and
- * push matching outputs onto `ctx.selectorState.matches`.
- *
- * @param {object} target
- * @param {import('./selector/parse.js').PseudoCond[]} positional
- * @param {object | null} ownerNode          The parent element (unused, kept
- *                                            for future error context).
- * @param {object[]} siblings
- * @param {import('./scope.js').Env} env
- * @param {object} ctx
- */
-function walkAndTrackChildren(target, positional, ownerNode, siblings, env, ctx) {
-    void ownerNode;
-    const frame = {
-        total: 0,
-        byTag: new Map(),
-        emissions: [],     // { buffer: string, index: number, ofTypeIndex: number, tag: string }
-    };
-
-    for (const child of siblings) {
-        trackChildEmissions(child, target, env, ctx, frame);
-        if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
-    }
-
-    // Now that totals are known, evaluate predicates on each candidate emission.
-    for (const em of frame.emissions) {
-        const pos = {
-            index: em.index,
-            total: frame.total,
-            ofTypeIndex: em.ofTypeIndex,
-            ofTypeTotal: frame.byTag.get(em.tag) ?? 0,
-        };
-        if (positional.every(p => evalPositional(p, pos))) {
-            ctx.selectorState.matches.push({ templateName: ctx.name, output: em.buffer });
-            if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
-        }
-    }
-}
-
-/**
- * Walk a single child node of a tracked parent, incrementing emission
- * counters and buffering the target's emissions.
- *
- * @param {object} child
- * @param {object} target
- * @param {import('./scope.js').Env} env
- * @param {object} ctx
- * @param {{ total: number, byTag: Map<string, number>, emissions: Array<{ buffer: string, index: number, ofTypeIndex: number, tag: string }> }} frame
- */
-function trackChildEmissions(child, target, env, ctx, frame) {
-    if (child.type === 'text' || child.type === 'comment') return;
-
-    if (child.type === 'chain') {
-        // Evaluate branches; at most one emits.
-        for (const branch of child.branches) {
-            let selected = false;
-            if (branch.cond === null) selected = true;
-            else selected = !!safeEvaluate(branch.cond, env, ctx, branch.node);
-            if (selected) {
-                trackElementEmission(branch.node, target, env, ctx, frame);
-                return;
-            }
-        }
-        return;
-    }
-
-    if (child.type === 'element') {
-        trackElementEmission(child, target, env, ctx, frame);
-        return;
-    }
-}
-
-/**
- * Emit a single element that participates in position tracking. Handles
- * x-for / x-each iteration (each iteration = 1 emission) and everything
- * else (1 emission). When the element is the sought target we capture the
- * emission into a buffer for later predicate evaluation.
- *
- * @param {object} el
- * @param {object} target
- * @param {import('./scope.js').Env} env
- * @param {object} ctx
- * @param {{ total: number, byTag: Map<string, number>, emissions: any[] }} frame
- */
-function trackElementEmission(el, target, env, ctx, frame) {
-    if (el.invisibleMarker) return;
-    const d = el.directives;
-
-    if (d.for) {
-        const { varName, start, stop, step: stepVal } = d.for;
-        const ascending = stepVal > 0;
-        for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
-            pushFrame(env, 'loop', { [varName]: i });
-            try {
-                recordEmission(el, target, frame, ctx, () => renderElementOnce(el, env, ctx));
-            } catch (sig) {
-                if (sig instanceof BreakSignal) {
-                    popFrame(env);
-                    return;
-                }
-                throw sig;
-            }
-            popFrame(env);
-        }
-        return;
-    }
-    if (d.each) {
-        const collection = safeEvaluate(d.each.collection, env, ctx, el);
-        if (!Array.isArray(collection)) {
-            throw makeRuntimeError(
-                `x-each: expected array, got ${describeValue(collection)}`,
-                ctx, el, { directive: 'x-each' }
-            );
-        }
-        const { itemName, indexName } = d.each;
-        for (let i = 0; i < collection.length; i++) {
-            const frameVars = { [itemName]: collection[i] };
-            if (indexName) frameVars[indexName] = i;
-            pushFrame(env, 'loop', frameVars);
-            try {
-                recordEmission(el, target, frame, ctx, () => renderElementOnce(el, env, ctx));
-            } catch (sig) {
-                if (sig instanceof BreakSignal) {
-                    popFrame(env);
-                    return;
-                }
-                throw sig;
-            }
-            popFrame(env);
-        }
-        return;
-    }
-    // Non-iteration path — delegate to renderElement so x-match is handled once.
-    recordEmission(el, target, frame, ctx, () => renderElement(el, env, ctx));
-}
-
-/**
- * Emit `el` via `emit()` while recording its runtime position in `frame`.
- * If `el === target`, capture the emission's bytes into a buffer; otherwise
- * discard them but still count the emission.
- *
- * @param {object} el
- * @param {object} target
- * @param {{ total: number, byTag: Map<string, number>, emissions: any[] }} frame
- * @param {object} ctx
- * @param {() => void} emit
- */
-function recordEmission(el, target, frame, ctx, emit) {
-    frame.total += 1;
-    const tag = el.tagName;
-    const nextOfType = (frame.byTag.get(tag) ?? 0) + 1;
-    frame.byTag.set(tag, nextOfType);
-
-    if (el !== target) {
-        // Not the target — discard bytes but drive the walker so nested
-        // candidates (unlikely with single-fragment contract, but possible
-        // if an ancestor is included in a broader search) still register.
-        const savedOut = ctx.out;
-        ctx.out = [];
-        try { emit(); } finally { ctx.out = savedOut; }
-        return;
-    }
-
-    // Capture into a fresh buffer so we can preserve the emission independent
-    // of the outer discard sink.
-    const savedOut = ctx.out;
-    const buf = [];
-    ctx.out = buf;
-    try { emit(); } finally { ctx.out = savedOut; }
-    frame.emissions.push({
-        buffer: buf.join(''),
-        index: frame.total,
-        ofTypeIndex: nextOfType,
-        tag,
-    });
-}
 
 /**
  * Run `emit()`, capturing everything written to `ctx.out` into a new buffer.
