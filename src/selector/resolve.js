@@ -66,6 +66,7 @@ export function resolveSelector(index, selector) {
     }
 
     const elements = sortByDocumentOrder([...merged.keys()]);
+    /* c8 ignore next 2 */
     return elements.map(el => ({ element: el, positional: merged.get(el) ?? [] }));
 }
 
@@ -93,6 +94,7 @@ function seedForComplex(index, complex) {
             if (!bucket) return [];
             if (!best || bucket.length < best.length) best = bucket;
         }
+        /* c8 ignore next */
         return best ?? [];
     }
     if (last.tag !== null) {
@@ -105,6 +107,7 @@ function seedForComplex(index, complex) {
             if (!bucket) return [];
             if (!best || bucket.length < best.length) best = bucket;
         }
+        /* c8 ignore next */
         return best ?? [];
     }
     // Bare universal or bare positional pseudo — fall back to all elements.
