@@ -37,11 +37,11 @@ const html = reflow.render('layout', {
 
 Includes are **not** transclusion. The included template renders in its own lexical scope: **globals (`$`) are inherited, but the parent's `x-data`, `x-for`, and `x-each` variables are not**.
 
-That means the sidebar sees `$.user`, but if the layout also declares `x-data="site: {...}"`, the sidebar cannot reach `@site` — it would need its own `x-data` (which the layout can seed via globals) or receive the value through `$`.
+That means the sidebar sees `$.user`, but if the layout also declares `x-data="site: {...}"`, the sidebar cannot reach `@site` — it must read the value from `$` directly, or declare its own `x-data`.
 
 ```html
 <!-- layout: exposes @site to itself only -->
-<body x-data="site: { name: $.siteName }">
+<body x-data="site: { name: 'Reflow' }">
   <header>
     <span x-text="@site.name"></span>            <!-- ok -->
   </header>

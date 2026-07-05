@@ -81,22 +81,24 @@ If nothing is being shadowed, `.name` and `@name` behave the same way — but pi
 
 ## Include boundaries
 
-An included template inherits only `$` — the caller's `x-data` scopes and loop variables are **not** visible inside it. If a partial needs context, feed it through `$`:
+An included template inherits only `$` — the caller's `x-data` scopes and loop variables are **not** visible inside it. If a partial needs context, put it on `$` before rendering:
 
 ```html
 <!-- layout.html -->
-<div x-data="site: { name: $.siteName }">
+<div x-data="site: { name: 'Reflow' }">
   <header>
     <span x-text="@site.name"></span>                <!-- visible here -->
   </header>
   <main x-include="'feed'"></main>                   <!-- @site not visible inside feed -->
 </div>
 
-<!-- feed.html — reaches through globals -->
+<!-- feed.html — the caller's @site is not visible; reach through globals -->
 <section>
   <h1 x-text="$.siteName"></h1>
 </section>
 ```
+
+`x-data` values are literal JSON5 (no `$` / `@` / `.` interpolation), so a partial that needs a dynamic value must read it from `$` at the use site.
 
 This design keeps included templates fully composable: they never depend on what their host template happens to declare.
 

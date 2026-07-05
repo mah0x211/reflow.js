@@ -15,6 +15,8 @@ The attribute value is parsed as [JSON5](https://json5.org/) — the object body
 
 Each scope value can be any JSON5 value (object, array, string, number, boolean, null). Objects are the most common; the fields inside become reachable via `@name.field`, `.name.field`, etc.
 
+Values are **literal**. `x-data` is parsed once at compile time, so runtime references such as `$`, `@name`, and `.name` are not evaluated inside it — a raw `$` in the value is a JSON5 syntax error and fails compilation.
+
 ## Semantics
 
 - Frames are pushed **before** evaluating any other directive on the element. `x-bind`, `x-text`, etc. on the same element can already reference the scope.
@@ -53,15 +55,18 @@ Each scope value can be any JSON5 value (object, array, string, number, boolean,
 </div>
 ```
 
-### Seeding scope from globals
+### Reading globals at the use site
 
-The scope value is JSON5, so you can reference `$`:
+Because `x-data` is a JSON5 literal, values from `$` (or from an outer `@name` / loop variable) cannot be inlined into it. Reference them directly where they are needed instead:
 
 ```html
-<div x-data="user: { name: $.currentUserName, id: $.currentUserId }">
-  <span x-text="@user.name"></span>
+<div>
+  <span x-text="$.currentUserName"></span>
+  <span x-text="$.currentUserId"></span>
 </div>
 ```
+
+If you specifically want a named handle for something the caller supplies, pass it under a stable key on `$` and refer to it as `$.key` at the use site.
 
 ### Layering scopes down the tree
 
