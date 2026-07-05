@@ -1,7 +1,30 @@
 {
     "name": "@mah0x211/reflow",
     "version": "0.0.0-dev",
-    "description": "An attribute-based HTML template engine that renders declarative HTML attributes into HTML.",
+    "description": "An attribute-based, no-eval HTML template engine that renders x-* attributes into HTML on Node.js and Cloudflare Workers.",
+    "license": "MIT",
+    "keywords": [
+        "template-engine",
+        "html-template",
+        "ssr",
+        "server-side-rendering",
+        "cloudflare-workers",
+        "workerd",
+        "htmx",
+        "no-eval",
+        "declarative",
+        "html",
+        "attributes",
+        "reflow"
+    ],
+    "homepage": "https://github.com/mah0x211/reflow.js#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/mah0x211/reflow.js.git"
+    },
+    "bugs": {
+        "url": "https://github.com/mah0x211/reflow.js/issues"
+    },
     "type": "module",
     "main": "./src/index.js",
     "types": "./dist/index.d.ts",
