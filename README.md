@@ -120,22 +120,108 @@ class Reflow {
     helpers?: Record<string, Function>;
     loader?: (path: string) => Promise<string>;
     maxIncludeDepth?: number;   // default 50
+    selectorCacheSize?: number; // default 128 (0 disables auto-parsing cache)
   });
 
   compile(name: string, html: string): Promise<void>;
   compileFile(name: string, pathname: string): Promise<void>;
-  render(name: string, data?: object): string;
+  render(name: string, data?: object, selector?: string | CompiledSelector): string;
   clear(name?: string): string[];
   templates(): string[];
 
-  static render(html: string, data?: object, config?: Config): Promise<string>;
-  static renderFile(pathname: string, data?: object, config?: Config): Promise<string>;
+  static compileSelector(source: string): CompiledSelector;
+  static render(html: string, data?: object,
+                config?: Config & { selector?: string | CompiledSelector }): Promise<string>;
+  static renderFile(pathname: string, data?: object,
+                    config?: Config & { selector?: string | CompiledSelector }): Promise<string>;
 }
 ```
 
 - `compile` is async. Registering the same name twice fails fast — call `clear(name)` first to re-register.
 - `render` is synchronous, and so are all helpers.
 - The static methods are uncached one-shots. For repeated rendering, use an instance.
+- The optional third argument to `render` extracts a single element by CSS selector; see [Selector fragments](#selector-fragments).
+
+## Selector fragments
+
+`render(name, data, selector)` renders only the single element matched by a CSS selector and returns its outer HTML. This is the recommended way to serve HTMX / Turbo Frame partials, extract e-mail sections, or verify page fragments in tests, all from a single template.
+
+```js
+const reflow = new Reflow();
+await reflow.compile('page', `
+  <div>
+    <header id="hdr"><h1 x-text="$.title"></h1></header>
+    <main x-each="p in $.posts" class="post">
+      <h2 x-text=".p.title"></h2>
+    </main>
+  </div>
+`);
+
+reflow.render('page', { title: 'Hi', posts: [{title:'a'},{title:'b'}] }, '#hdr');
+// → '<header id="hdr"><h1>Hi</h1></header>'
+```
+
+### Single-fragment contract
+
+Selector-based rendering requires exactly one runtime element to match. Anything else is Fail-fast:
+
+- Zero matches → `ReflowSelectorError { reason: 'no_match' }`
+- Two or more matches → `ReflowSelectorError { reason: 'multiple_matches' }`
+
+Design your templates so the intended fragment is uniquely identifiable — usually by an `id` attribute or a `data-*` marker. `x-each` around a candidate produces one runtime element per iteration; place the selector's anchor outside the loop or use a positional pseudo-class (see below) to disambiguate.
+
+### Supported syntax
+
+Only the constructs that make sense for server-side fragment fetching are accepted; every other CSS construct is Fail-fast at parse time (`ReflowSelectorError { reason: 'unsupported' }`).
+
+| Construct | Example | Supported |
+|---|---|---|
+| Type / universal | `div`, `*` | ✅ |
+| ID | `#header` | ✅ |
+| Class | `.article` | ✅ |
+| Attribute | `[data-x]`, `[href^="https"]`, all six operators (`=` `~=` `\|=` `^=` `$=` `*=`) | ✅ |
+| Compound | `article#post.body[data-slug]` | ✅ |
+| Selector list | `#a, .b, c[d]` | ✅ |
+| Descendant combinator | `section article` | ✅ |
+| Child combinator | `ul > li` | ✅ |
+| Sibling combinators (`+`, `~`) | | ❌ Not supported |
+| Column combinator (`\|\|`) | | ❌ Not supported |
+| Positional pseudo-classes | `:first-child`, `:last-child`, `:only-child`, `:first-of-type`, `:last-of-type`, `:only-of-type`, `:nth-child(n)`, `:nth-last-child(n)`, `:nth-of-type(n)`, `:nth-last-of-type(n)` | ✅ Integer literal only (no `An+B`, `odd`, `even`) |
+| Positional pseudo-classes on non-rightmost compound | `#foo:first-child .bar` | ❌ Not supported |
+| State / logical / other pseudo-classes (`:not`, `:is`, `:where`, `:has`, `:hover`, ...) | | ❌ Not supported |
+| Pseudo-elements (`::before`, ...) | | ❌ Not supported |
+| Attribute namespaces / case flags | `[ns\|attr]`, `[a="b" i]` | ❌ Not supported |
+
+### Static vs runtime semantics
+
+- Static structural selectors (tag / id / class / attribute / combinators) match the attributes **as written in the template source**. Values produced at runtime by `x-bind:*` are not considered — use `data-*` markers when you need selector-visible attributes.
+- Positional pseudo-classes count **runtime emissions**: an `x-if` branch that renders contributes 1, a false branch contributes 0, and each `x-each` iteration contributes 1.
+
+For example:
+
+```html
+<ul x-match="$.status">
+  <li>Status:</li>
+  <li x-case="'ok'">OK</li>
+  <li x-case="'fail'">Fail</li>
+  <li><a href="/status">details</a></li>
+</ul>
+```
+
+`ul li:nth-child(2)` returns `<li>OK</li>` or `<li>Fail</li>` depending on `$.status`, because only one case is rendered at runtime.
+
+### x-include boundaries
+
+If the current template has zero candidates for the selector but declares `x-include` elements, each include is executed and the included template is searched recursively. Include-side errors (`not_found`, `cycle`, `depth_exceeded`) fire under the same conditions as full-document rendering. Once the current template contributes at least one candidate, cross-include search is skipped.
+
+### Pre-compiling selectors
+
+Selector strings passed to `render` are memoised in a per-instance LRU (`selectorCacheSize`, default 128; set to 0 to disable). Invalid selectors are never cached, so pathological input cannot bloat memory. For zero-parse hot paths, compile once and reuse:
+
+```js
+const HEADER = Reflow.compileSelector('#header');
+app.get('/header-only', (_, res) => res.send(reflow.render('page', data, HEADER)));
+```
 
 ## Usage with Cloudflare Workers
 
@@ -173,7 +259,7 @@ export default {
 ## Error handling
 
 ```js
-import { ReflowCompileError, ReflowRuntimeError, ReflowIncludeError } from '@mah0x211/reflow';
+import { ReflowCompileError, ReflowRuntimeError, ReflowIncludeError, ReflowSelectorError } from '@mah0x211/reflow';
 
 try {
   await reflow.compile('page', html);
@@ -186,7 +272,7 @@ try {
 }
 ```
 
-All errors expose `snippet` (with surrounding context), `line`, `column`, and `element` (the reconstructed open tag). Include errors additionally expose `includeStack` and `reason` (`'not_found'`, `'cycle'`, or `'depth_exceeded'`).
+All errors expose `snippet` (with surrounding context), `line`, `column`, and `element` (the reconstructed open tag). Include errors additionally expose `includeStack` and `reason` (`'not_found'`, `'cycle'`, `'depth_exceeded'`, or `'invalid'`). Selector errors carry `reason` (`'syntax'`, `'unsupported'`, `'multiple_matches'`, or `'no_match'`); `syntax` / `unsupported` also expose `source` and either `position` or `feature`, and `multiple_matches` / `no_match` expose `templateName`.
 
 ## Development
 
