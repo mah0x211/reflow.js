@@ -8,10 +8,13 @@
 
 import { ReflowError, ReflowCompileError, ReflowRuntimeError } from './errors.js';
 import { compileTemplate } from './compile.js';
-import { render as renderCompiled } from './interpret.js';
+import { render as renderCompiled, renderFragment } from './interpret.js';
+import { parseSelector } from './selector/parse.js';
+import { SelectorCache } from './selector/cache.js';
 
 const DEFAULT_MAX_INCLUDE_DEPTH = 50;
 const DEFAULT_PREFIX = 'x-';
+const DEFAULT_SELECTOR_CACHE_SIZE = 128;
 
 /**
  * @typedef {object} Config
@@ -28,6 +31,12 @@ const DEFAULT_PREFIX = 'x-';
  *                                                       Fail-fast).
  * @property {number} [maxIncludeDepth]                  Upper bound on x-include nesting; default 50. Exceeding it is
  *                                                       Fail-fast at render time.
+ * @property {number} [selectorCacheSize]                Upper bound on the internal LRU cache of parsed selectors used
+ *                                                       when `render(...)` is called with a raw string; default 128, and
+ *                                                       0 disables caching entirely. Only successful parses are inserted
+ *                                                       so unbounded invalid input cannot inflate memory. Callers who
+ *                                                       want zero-parse hot paths can pre-compile with
+ *                                                       `Reflow.compileSelector(source)` and pass the result directly.
  */
 
 export class Reflow {
@@ -40,8 +49,9 @@ export class Reflow {
         this._helperNames = new Set(Object.keys(this._helpers));
         this._loader = config.loader ?? null;
         this._maxIncludeDepth = config.maxIncludeDepth ?? DEFAULT_MAX_INCLUDE_DEPTH;
-        /** @type {Map<string, { root: object, html: string }>} */
+        /** @type {Map<string, { root: object, html: string, index: object }>} */
         this._templates = new Map();
+        this._selectorCache = new SelectorCache(config.selectorCacheSize ?? DEFAULT_SELECTOR_CACHE_SIZE);
     }
 
     /**
@@ -93,18 +103,37 @@ export class Reflow {
 
     /**
      * Render a registered template with the given data as globals ($).
+     * When `selector` is provided, only the single element matched by the
+     * CSS selector is rendered and its outer HTML is returned; matching
+     * zero or more than one element raises ReflowSelectorError. Selector
+     * strings are parsed once and memoized in the per-instance LRU cache
+     * (see `selectorCacheSize`); a pre-compiled selector produced by
+     * `Reflow.compileSelector` skips the cache entirely.
      *
      * @param {string} name
      * @param {object} [data]
+     * @param {string | import('./selector/parse.js').CompiledSelector} [selector]
      * @returns {string}
      */
-    render(name, data = {}) {
+    render(name, data = {}, selector) {
         const compiled = this._templates.get(name);
         if (!compiled) {
             throw new ReflowRuntimeError(
                 `template not found: "${name}"`,
                 { templateName: name, reason: 'not_found', requested: name }
             );
+        }
+        if (selector !== undefined) {
+            const resolved = this._selectorCache.resolve(selector);
+            return renderFragment({
+                name,
+                compiled,
+                data,
+                helpers: this._helpers,
+                templates: this._templates,
+                maxIncludeDepth: this._maxIncludeDepth,
+                selector: resolved,
+            });
         }
         return renderCompiled({
             name,
@@ -143,20 +172,33 @@ export class Reflow {
     }
 
     /**
+     * Parse a CSS selector source into a CompiledSelector. Static — the
+     * returned object is safe to share across instances and renders and has
+     * no side effects (no cache mutation).
+     *
+     * @param {string} source
+     * @returns {import('./selector/parse.js').CompiledSelector}
+     */
+    static compileSelector(source) {
+        return parseSelector(source);
+    }
+
+    /**
      * One-shot render with no caching: compile the HTML, render once, discard.
      * Suitable for CLIs, tests, or one-off generation. Do not use on a hot
      * production path — use an instance and compile once instead.
      *
      * @param {string} html
      * @param {object} [data]
-     * @param {Config} [config]
+     * @param {Config & { selector?: string | import('./selector/parse.js').CompiledSelector }} [config]
      * @returns {Promise<string>}
      */
     static async render(html, data = {}, config = {}) {
-        const reflow = new Reflow(config);
+        const { selector, ...rest } = config;
+        const reflow = new Reflow(rest);
         const name = '<inline>';
         await reflow.compile(name, html);
-        return reflow.render(name, data);
+        return reflow.render(name, data, selector);
     }
 
     /**
@@ -164,13 +206,14 @@ export class Reflow {
      *
      * @param {string} pathname
      * @param {object} [data]
-     * @param {Config} [config]
+     * @param {Config & { selector?: string | import('./selector/parse.js').CompiledSelector }} [config]
      * @returns {Promise<string>}
      */
     static async renderFile(pathname, data = {}, config = {}) {
-        const reflow = new Reflow(config);
+        const { selector, ...rest } = config;
+        const reflow = new Reflow(rest);
         const name = '<inline>';
         await reflow.compileFile(name, pathname);
-        return reflow.render(name, data);
+        return reflow.render(name, data, selector);
     }
 }
