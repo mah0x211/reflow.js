@@ -20,7 +20,7 @@ The rest of this file is a short overview; head to `docs/` for the full spec.
 - **Declarative directives** — Data binding, conditionals, iteration, and template composition are expressed through `x-*` attributes (configurable prefix).
 - **Renders to plain HTML** — Directives are resolved at render time; the output is plain HTML with no client-side runtime emitted.
 - **No `eval` / `new Function`** — A purpose-built expression parser and a fixed IR interpreter replace dynamic code generation.
-- **Symbol-based scopes** — Three scope families: `$` (globals), `@name` (a named `x-data`), and `.` (the nearest lexical binding).
+- **Symbol-based scopes** — Three scope families: `$` (globals), `@name` (a named `x-data` / `x-with`), and `.` (the nearest lexical binding).
 - **Fail-fast** — Errors surface at compile or render time with a source snippet, line/column, the reconstructed element, and the include stack.
 - **`x-include`** — Compose compiled templates to build layouts.
 
@@ -65,7 +65,8 @@ The directive prefix is `x-` by default and configurable via the `prefix` option
 
 | Directive | Purpose |
 |---|---|
-| `x-data="name: {...}"` | Declares one or more named scopes (JSON5; multiple top-level keys allowed). |
+| `x-data="name: {...}"` | Declares one or more named scopes at compile time (JSON5; multiple top-level keys allowed). |
+| `x-with="name = expr, ..."` | Declares one or more named bindings at render time (RHS is any expression). Also the way to pass named values across an `x-include` boundary. |
 | `x-text="expr"` | Replaces the element's text content with the expression result (HTML-escaped). |
 | `x-html="expr"` | Replaces the element's content with raw HTML (no escaping). |
 | `x-bind:name="expr"` | Sets an attribute. `true` emits a bare attribute; `null`/`undefined`/`false` omit it. |
@@ -85,10 +86,10 @@ Every expression resolves through one of three symbols. There are no un-prefixed
 | Symbol | Refers to | Source |
 |---|---|---|
 | `$` | Globals passed to `render()` | The `data` argument of `render(name, data)`. |
-| `@name` | A named `x-data` scope | The matching `x-data="name: {...}"`. |
-| `.` | The nearest lexical binding | Any enclosing `x-data`, `x-for`, or `x-each`. |
+| `@name` | A named `x-data` or `x-with` scope | The nearest matching `x-data`/`x-with` frame. |
+| `.` | The nearest lexical binding | Any enclosing `x-data`, `x-with`, `x-for`, or `x-each`. |
 
-`@name` searches only `x-data` frames; `.` searches every frame (including loop variables), innermost first. The difference matters when a loop variable shadows a `x-data` scope of the same name: `.` binds to the loop variable, `@` reaches the `x-data`.
+`@name` searches only `data` frames (from `x-data` and `x-with`); `.` searches every frame (including loop variables), innermost first. The difference matters when a loop variable shadows a same-named `x-data`/`x-with` scope: `.` binds to the loop variable, `@` reaches the outer data frame.
 
 ```html
 <div x-data="user: { name: 'Alice' }">
@@ -101,7 +102,7 @@ Every expression resolves through one of three symbols. There are no un-prefixed
 </div>
 ```
 
-An included template only inherits `$`; the parent's lexical scope (`x-data`, loop variables) is not visible inside it.
+An included template only inherits `$` plus any `x-with` bindings declared on the include element; the parent's other `x-data`, `x-for`, and `x-each` variables are not visible inside it. See [`x-with`](docs/template/directives/x-with.md) for the passing-in mechanism.
 
 ## Expression language
 

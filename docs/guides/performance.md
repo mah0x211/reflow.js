@@ -6,7 +6,7 @@ This page documents the algorithmic complexity of the compile / render / fragmen
 
 - **Parse once, render many.** Compile is asynchronous (drives HTMLRewriter) and does all the work: source scan, IR construction, chain / match consolidation, static validation, and the selector index. Render is synchronous and touches only the IR plus scope frames.
 - **No client runtime, no `eval`.** The interpreter walks a fixed IR and evaluates expressions through a small hand-written AST evaluator; there is no code generation.
-- **Fragment rendering is a first-class path.** Passing a selector to `render` skips unrelated subtrees entirely via a targeted walk that jumps from the root to the candidate through the ancestor chain of control-flow directives (`x-data`, `x-if`, `x-match`, `x-for`, `x-each`) and stops.
+- **Fragment rendering is a first-class path.** Passing a selector to `render` skips unrelated subtrees entirely via a targeted walk that jumps from the root to the candidate through the ancestor chain of control-flow directives (`x-data`, `x-with`, `x-if`, `x-match`, `x-for`, `x-each`) and stops.
 
 ## Complexity
 

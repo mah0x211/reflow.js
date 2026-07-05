@@ -18,13 +18,18 @@ comparison    := unary (comparison_op unary)?
 comparison_op := '==' | '!=' | '<=' | '>=' | '<' | '>'
 unary         := ('!')? postfix
 postfix       := primary ('?.' identifier | '.' identifier)*
-primary       := literal | scope_ref | helper_call | '(' expr ')'
+primary       := literal | scope_ref | helper_call | object_lit | array_lit | '(' expr ')'
 scope_ref     := '$' path_tail
                | '@' identifier path_tail
                | '.' identifier path_tail
 path_tail     := ('.' identifier | '?.' identifier)*
 helper_call   := identifier '(' arg_list? ')'
 arg_list      := expr (',' expr)*
+object_lit    := '{' (entry (',' entry)* ','?)? '}'
+entry         := object_key ':' expr
+object_key    := identifier | string_literal | number_literal | '[' key_expr ']'
+key_expr      := string_literal | number_literal | scope_ref path_tail
+array_lit     := '[' (expr (',' expr)* ','?)? ']'
 literal       := string_literal | number_literal | 'true' | 'false' | 'null'
 ```
 
@@ -35,7 +40,8 @@ The parser Fail-fasts (`ReflowCompileError`) on any of:
 - Arithmetic (`+`, `-`, `*`, `/`, `%`) — use a helper.
 - String concatenation — use a helper (`cat('Hello, ', $.name)`).
 - Method calls (`x.trim()`) — call a helper that wraps the method (`trim($.x)`).
-- Array / object / template literals (`[a, b]`, `{ k: v }`, `` `x${y}` ``) — build the value in `data` or via a helper.
+- Template literals (`` `x${y}` ``) — use a helper.
+- Helper calls or operators as **computed object keys** — `key_expr` accepts only string / number literals and scope references.
 - Assignment, regex, bitwise operators, `in`, `instanceof`, `typeof`, `void`, `delete`.
 
 Banning method calls also prevents `.constructor`-based prototype escapes: `$.user.constructor(...)` is not parseable, full stop.
@@ -59,6 +65,25 @@ Numbers: integer or decimal, with an optional leading minus. Scientific notation
 ```
 
 Booleans and null: `true`, `false`, `null` are keywords. `undefined` is not a literal — reference an unresolvable scope path (e.g. `$.does.not.exist?.name`) if you need it.
+
+## Composite literals
+
+Object and array literals build a fresh value each time the expression is evaluated. Every entry value is an expression, so composite literals nest naturally and pull data from `$` / `@` / `.` / helpers.
+
+```html
+<div x-with="pair = { first: $.a, second: $.b }"></div>
+<div x-with="nums = [1, $.n, $.m]"></div>
+```
+
+Object keys can be a bare identifier, a string literal, a number literal, or a bracketed **computed** key (`[expr]`). Computed keys are restricted to string / number literals and scope references — helper calls and operators are not accepted there, keeping key evaluation side-effect-free.
+
+```html
+<div x-with="obj = { name: $.n, [$.dynKey]: 'v', 42: 'answer' }"></div>
+```
+
+If a computed key evaluates to anything other than a string or a number, the render throws `ReflowRuntimeError`. Duplicate keys (whether static or computed) resolve last-write-wins, matching JavaScript object-literal semantics.
+
+Composite literals appear anywhere an expression is expected, but their primary use is on `x-with` (see [`x-with`](./directives/x-with.md)) — the JSON5-based `x-data` is a static literal and does not accept them.
 
 ## Operators
 
@@ -141,6 +166,7 @@ The expression language does not coerce values; the directive that consumes the 
 - `x-html` requires a string.
 - `x-include` requires a string (the template name).
 - `x-each` requires an array.
+- `x-with` binds each RHS value as-is (objects, arrays, primitives, and so on).
 - `x-if` / `x-elseif` / `x-break-if` coerce with `!!`.
 - `x-match` / `x-case` compare with strict `===`.
 
