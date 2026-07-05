@@ -1445,7 +1445,7 @@ function finalizeMatches(state, entryTemplateName, selector) {
     }
     if (state.matches.length > 1) {
         throw new ReflowSelectorError(
-            `selector "${selector.source}" matched ${state.matches.length}${state.matches.length >= 2 ? '+' : ''} elements; the single-fragment contract requires exactly one`,
+            `selector "${selector.source}" matched ${state.matches.length}+ elements; the single-fragment contract requires exactly one`,
             {
                 reason: 'multiple_matches',
                 templateName: entryTemplateName,
