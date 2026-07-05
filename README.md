@@ -6,6 +6,14 @@
 
 An attribute-based HTML template engine that renders declarative HTML attributes into HTML. Data binding, conditionals, iteration, and template composition are expressed using directive attributes such as `x-text`, `x-if`, and `x-each`. The directive prefix (`x-` by default) is configurable, allowing templates to coexist with client-side libraries that use the same attribute convention.
 
+## Documentation
+
+Full documentation lives under [`docs/`](./docs/README.md):
+
+- **Reference** — [API](./docs/api.md) · [template syntax](./docs/template/README.md) · [expression language](./docs/template/expressions.md) · [scope resolution](./docs/template/scopes.md) · [per-directive pages](./docs/template/directives/README.md)
+- **Guides** — [getting started](./docs/guides/getting-started.md) · [fragment rendering](./docs/guides/fragment-rendering.md) · [template composition](./docs/guides/template-composition.md) · [performance and memory](./docs/guides/performance.md)
+
+The rest of this file is a short overview; head to `docs/` for the full spec.
 
 ## Features
 
