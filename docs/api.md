@@ -166,7 +166,7 @@ Common metadata (present when applicable):
 
 ### `class ReflowCompileError`
 
-Thrown by `compile()` for statically detectable failures: HTML parse errors, unknown `x-*` attributes, invalid `x-data` / `x-for` / `x-each` values, orphan `x-elseif` / `x-else` / `x-case` / `x-nocase`, forbidden directive combinations, unregistered helper references, duplicate `x-data`, `x-break` outside a loop, malformed expressions, and duplicate template registration.
+Thrown by `compile()` for statically detectable failures: HTML parse errors, unknown `x-*` attributes, invalid `x-data` / `x-with` / `x-for` / `x-each` values, orphan `x-elseif` / `x-else` / `x-case` / `x-nocase`, forbidden directive combinations, unregistered helper references, duplicate `x-data`, duplicate `x-with`, `x-data` / `x-with` name collisions on the same element, `x-break` outside a loop, malformed expressions, and duplicate template registration.
 
 ### `class ReflowRuntimeError`
 

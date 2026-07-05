@@ -40,7 +40,7 @@ const html = reflow.render('greeting', { hobbies: ['coding', 'reading'] });
 
 - `compile()` parses the HTML once. The resulting IR is cached on the instance.
 - `render()` walks the IR synchronously against `data` (exposed as `$`) and returns a string.
-- `x-data="user: {...}"` declares a named scope reachable as `@user`.
+- `x-data="user: {...}"` declares a compile-time named scope reachable as `@user`. Its runtime-evaluated counterpart is [`x-with`](../template/directives/x-with.md).
 - `x-text` replaces the element's body with the escaped expression value.
 - `x-each` iterates an array; `.hobby` refers to the current loop item.
 - `upper` is a helper — a synchronous function the instance was constructed with. Helpers are the only way to run arbitrary JavaScript in an expression; the expression language itself does not allow arithmetic, method calls, or template literals.

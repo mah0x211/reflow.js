@@ -13,6 +13,14 @@
  *   { type: 'binary', op, left, right }                 // comparison / logical / coalesce
  *   { type: 'ternary', test, consequent, alternate }
  *   { type: 'call', callee, args }                      // helper call, callee = identifier
+ *   { type: 'object', entries: [{ key, value }] }       // { k: v, [ref]: v, ... }
+ *   { type: 'array', items }                            // [ v, v, ... ]
+ *
+ * Object entry key nodes:
+ *   { type: 'literal', value }                          // static string / number key
+ *   { type: 'computed', expr }                          // [expr] key, expr is limited
+ *                                                       //   to primitive literal or scope
+ *                                                       //   reference (no helpers / operators)
  *
  * Each AST node also carries `source` (the substring it was parsed from)
  * and `offset` (starting index within the original expression string).
@@ -47,19 +55,27 @@ export function parseExpression(source) {
  *   comparison_op := '==' | '!=' | '<=' | '>=' | '<' | '>'
  *   unary         := ('!')? postfix
  *   postfix       := primary ('?.' identifier | '.' identifier)*
- *   primary       := literal | scope_ref | helper_call | '(' expr ')'
+ *   primary       := literal | scope_ref | helper_call | object_lit | array_lit | '(' expr ')'
  *   scope_ref     := '$' path_tail
  *                  | '@' identifier path_tail
  *                  | '.' identifier path_tail
  *   path_tail     := ('.' identifier | '?.' identifier)*
  *   helper_call   := identifier '(' arg_list? ')'
  *   arg_list      := expr (',' expr)*
+ *   object_lit    := '{' (entry (',' entry)* ','?)? '}'
+ *   entry         := object_key ':' expr
+ *   object_key    := identifier | string_literal | number_literal | '[' key_expr ']'
+ *   key_expr      := string_literal | number_literal | scope_ref postfix_tail
+ *   array_lit     := '[' (expr (',' expr)* ','?)? ']'
  *   literal       := string_literal | number_literal | 'true' | 'false' | 'null'
  *
  * Disallowed (parse error): arithmetic, string concatenation, method calls,
- * array/object/template literals, assignment, regex, bitwise, in/instanceof,
- * typeof/void/delete. Delegate those to helpers. Banning method calls makes
- * .constructor-based prototype escapes lexically impossible.
+ * template literals, assignment, regex, bitwise, in/instanceof, typeof/void/
+ * delete. Computed object keys are restricted to primitive literals and scope
+ * references so that keys have no side effects and stay statically obvious
+ * enough to reason about. Delegate other computation to helpers. Banning
+ * method calls makes .constructor-based prototype escapes lexically
+ * impossible.
  */
 class Parser {
     /**
@@ -226,6 +242,16 @@ class Parser {
             return inner;
         }
 
+        // Object literal
+        if (ch === '{') {
+            return this.parseObjectLiteral(start);
+        }
+
+        // Array literal
+        if (ch === '[') {
+            return this.parseArrayLiteral(start);
+        }
+
         // String literal
         if (ch === "'" || ch === '"') {
             return this.readStringLiteral(start);
@@ -293,6 +319,179 @@ class Parser {
         }
 
         throw makeParseError(this, `unexpected character "${ch}"`);
+    }
+
+    /**
+     * Parse an object literal: `{ k: v, "s": v, 3: v, [ref]: v, ... }`.
+     * The opening `{` has already been peeked; consume it here.
+     * @param {number} start
+     */
+    parseObjectLiteral(start) {
+        this.pos++; // consume '{'
+        const entries = [];
+        this.skipWs();
+        if (this.src[this.pos] !== '}') {
+            while (true) {
+                const key = this.parseObjectKey();
+                this.skipWs();
+                this.expect(':');
+                const value = this.parseExpr();
+                entries.push({ key, value });
+                this.skipWs();
+                if (this.src[this.pos] === ',') {
+                    this.pos++;
+                    this.skipWs();
+                    if (this.src[this.pos] === '}') break; // trailing comma
+                    continue;
+                }
+                break;
+            }
+        }
+        this.skipWs();
+        this.expect('}');
+        return this.finish({ type: 'object', entries }, start);
+    }
+
+    /**
+     * Parse an array literal: `[ v, v, ... ]`.
+     * The opening `[` has already been peeked; consume it here.
+     * @param {number} start
+     */
+    parseArrayLiteral(start) {
+        this.pos++; // consume '['
+        const items = [];
+        this.skipWs();
+        if (this.src[this.pos] !== ']') {
+            while (true) {
+                items.push(this.parseExpr());
+                this.skipWs();
+                if (this.src[this.pos] === ',') {
+                    this.pos++;
+                    this.skipWs();
+                    if (this.src[this.pos] === ']') break; // trailing comma
+                    continue;
+                }
+                break;
+            }
+        }
+        this.skipWs();
+        this.expect(']');
+        return this.finish({ type: 'array', items }, start);
+    }
+
+    /**
+     * Parse an object entry key: an identifier, string literal, number
+     * literal, or a bracketed computed key. Computed keys accept only string /
+     * number literals and scope references (with member-access chain), keeping
+     * key evaluation side-effect-free and easy to reason about.
+     * Returns either `{ type: 'literal', value }` or `{ type: 'computed', expr }`.
+     */
+    parseObjectKey() {
+        this.skipWs();
+        const start = this.mark();
+        const ch = this.src[this.pos];
+
+        // Computed key: [<primitive | scope_ref>]
+        if (ch === '[') {
+            this.pos++;
+            this.skipWs();
+            const expr = this.parseComputedKeyExpr();
+            this.skipWs();
+            this.expect(']');
+            return this.finish({ type: 'computed', expr }, start);
+        }
+
+        // String literal key
+        if (ch === "'" || ch === '"') {
+            const lit = this.readStringLiteral(start);
+            return this.finish({ type: 'literal', value: lit.value }, start);
+        }
+
+        // Number literal key
+        if (isDigit(this.src.charCodeAt(this.pos)) ||
+            (ch === '-' && isDigit(this.src.charCodeAt(this.pos + 1)))) {
+            const lit = this.readNumberLiteral(start);
+            return this.finish({ type: 'literal', value: lit.value }, start);
+        }
+
+        // Identifier key — becomes a string key with the identifier's text
+        if (isIdStart(this.src.charCodeAt(this.pos))) {
+            const name = this.readIdentifier();
+            return this.finish({ type: 'literal', value: name }, start);
+        }
+
+        throw makeParseError(this, `expected object key (identifier, string, number, or [<expr>])`);
+    }
+
+    /**
+     * Parse the expression inside a computed key `[...]`. Restricted to
+     * primitive literals and scope references (with a `.field` / `?.field`
+     * member chain). Helper calls, operators, and nested literals are
+     * rejected here so that keys stay statically obvious.
+     */
+    parseComputedKeyExpr() {
+        this.skipWs();
+        const start = this.mark();
+        if (this.eof()) throw makeParseError(this, `unexpected end of computed key`);
+
+        const ch = this.src[this.pos];
+
+        // String literal
+        if (ch === "'" || ch === '"') {
+            return this.readStringLiteral(start);
+        }
+
+        // Number literal
+        if (isDigit(this.src.charCodeAt(this.pos)) ||
+            (ch === '-' && isDigit(this.src.charCodeAt(this.pos + 1)))) {
+            return this.readNumberLiteral(start);
+        }
+
+        // Scope reference — parse the primary, then walk the postfix chain
+        if (ch === '$' || ch === '@' || ch === '.') {
+            let node;
+            if (ch === '$') {
+                this.pos++;
+                if (this.src[this.pos] !== '.') {
+                    throw makeParseError(this, `"$" must be followed by ".<identifier>"`);
+                }
+                node = this.finish({ type: 'dollar' }, start);
+            } else if (ch === '@') {
+                this.pos++;
+                const name = this.readIdentifier();
+                if (!name) throw makeParseError(this, `"@" must be followed by an identifier`);
+                node = this.finish({ type: 'at', name }, start);
+            } else {
+                const nextCh = this.src.charCodeAt(this.pos + 1);
+                if (!isIdStart(nextCh)) {
+                    throw makeParseError(this, `"." must be followed by an identifier`);
+                }
+                this.pos++;
+                const name = this.readIdentifier();
+                node = this.finish({ type: 'dot', name }, start);
+            }
+            // postfix chain
+            while (true) {
+                this.skipWs();
+                if (this.starts('?.')) {
+                    this.pos += 2;
+                    const name = this.readIdentifier();
+                    if (!name) throw makeParseError(this, `expected identifier after "?."`);
+                    node = this.finish({ type: 'member', object: node, property: name, optional: true }, start);
+                } else if (this.starts('.')) {
+                    const nextCh = this.src.charCodeAt(this.pos + 1);
+                    if (!isIdStart(nextCh)) break;
+                    this.pos++;
+                    const name = this.readIdentifier();
+                    node = this.finish({ type: 'member', object: node, property: name, optional: false }, start);
+                } else {
+                    break;
+                }
+            }
+            return node;
+        }
+
+        throw makeParseError(this, `computed object key must be a string, number, or scope reference (helpers and operators are not allowed here)`);
     }
 
     // ==== Literals ====

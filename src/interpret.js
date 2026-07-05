@@ -53,10 +53,17 @@ class BreakSignal { }
  * @param {Map<string, object>} params.templates  All registered templates (for x-include).
  * @param {number} params.maxIncludeDepth
  * @param {string[]} [params.includeStack]
+ * @param {Record<string, unknown>} [params.initialBindings]  When provided
+ *        (from an x-with on the caller's x-include element), pushed as the
+ *        first `data` frame of the fresh env so that the included template
+ *        reaches the caller's x-with values via `@name` / `.name`.
  * @returns {string}
  */
-export function render({ name, compiled, data, helpers, templates, maxIncludeDepth, includeStack }) {
+export function render({ name, compiled, data, helpers, templates, maxIncludeDepth, includeStack, initialBindings }) {
     const env = createEnv(data);
+    if (initialBindings) {
+        pushFrame(env, 'data', initialBindings);
+    }
     const ctx = {
         name,
         html: compiled.html,
@@ -236,10 +243,19 @@ function renderElement(node, env, ctx) {
 /**
  * Emit the element once (open tag + attrs + body + close tag). Skips entirely
  * for invisible-marker elements (an element carrying only x-break /
- * x-break-if). A x-data frame is pushed before evaluating anything (x-bind may
- * reference it) and popped afterwards. Per iteration the order is: x-bind
- * attributes, then content (x-text / x-html / x-include), then emit open tag +
- * content + close tag. x-text / x-html / x-include are mutually exclusive and
+ * x-break-if). Frames are pushed before evaluating anything (x-bind may
+ * reference them) and popped afterwards. Frame order on this element:
+ *   1. x-data       (compile-time JSON5 literal)
+ *   2. x-with       (runtime expressions; evaluated once against the
+ *                    environment as it stands after x-data is pushed, so
+ *                    x-with expressions may reference the same element's
+ *                    x-data via `@name`)
+ * The common case (neither directive present) takes a fast path that skips
+ * the frame bookkeeping entirely — most elements in a template do not carry
+ * scope frames and this keeps the per-element overhead near what it was
+ * before x-with existed. Per iteration the order is: x-bind attributes,
+ * then content (x-text / x-html / x-include), then emit open tag + content
+ * + close tag. x-text / x-html / x-include are mutually exclusive and
  * override any existing children.
  *
  * @param {object} node
@@ -247,38 +263,80 @@ function renderElement(node, env, ctx) {
  * @param {object} ctx
  */
 function renderElementOnce(node, env, ctx) {
+    if (node.invisibleMarker) return;
     const d = node.directives;
 
-    // Invisible marker: entire element and its subtree are skipped.
-    // (Post-emit break check for this element is handled by the caller
-    // in renderElement's non-loop branch.)
-    if (node.invisibleMarker) return;
-
-    // Push x-data frame BEFORE evaluating anything else (x-bind may reference it)
-    const hasData = !!d.data;
-    if (hasData) {
-        pushFrame(env, 'data', d.data.scopes);
+    // Fast path: no scope frames to push. This covers the majority of
+    // elements in a template (anything without x-data or x-with).
+    if (!d.data && !d.with) {
+        emitElementBody(node, d, null, env, ctx);
+        return;
     }
+
+    // Slow path: push x-data first, then x-with. x-with expressions are
+    // evaluated against the environment as it stands after x-data was
+    // pushed, so they may reference @data-name from the same element.
+    const hasData = !!d.data;
+    if (hasData) pushFrame(env, 'data', d.data.scopes);
+    const withBindings = d.with
+        ? evaluateWithBindings(d.with.bindings, env, ctx, node)
+        : null;
+    if (withBindings) pushFrame(env, 'data', withBindings);
 
     try {
-        emitElementWithBody(node, env, ctx, () => {
-            // Body content resolution
-            if (d.text) {
-                const v = safeEvaluate(d.text.expr, env, ctx, node);
-                emitTextContent(v, ctx, node, 'x-text');
-            } else if (d.html) {
-                const v = safeEvaluate(d.html.expr, env, ctx, node);
-                emitHtmlContent(v, ctx, node);
-            } else if (d.include) {
-                const v = safeEvaluate(d.include.expr, env, ctx, node);
-                emitIncludeContent(v, env, ctx, node);
-            } else {
-                renderChildren(node.children, env, ctx);
-            }
-        });
+        emitElementBody(node, d, withBindings, env, ctx);
     } finally {
+        if (withBindings) popFrame(env);
         if (hasData) popFrame(env);
     }
+}
+
+/**
+ * Emit the element's open tag + body + close tag. Shared between the fast
+ * and slow paths of renderElementOnce.
+ *
+ * @param {object} node
+ * @param {object} d
+ * @param {Record<string, unknown> | null} withBindings
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ */
+function emitElementBody(node, d, withBindings, env, ctx) {
+    emitElementWithBody(node, env, ctx, () => {
+        if (d.text) {
+            const v = safeEvaluate(d.text.expr, env, ctx, node);
+            emitTextContent(v, ctx, node, 'x-text');
+        } else if (d.html) {
+            const v = safeEvaluate(d.html.expr, env, ctx, node);
+            emitHtmlContent(v, ctx, node);
+        } else if (d.include) {
+            const v = safeEvaluate(d.include.expr, env, ctx, node);
+            emitIncludeContent(v, env, ctx, node, withBindings);
+        } else {
+            renderChildren(node.children, env, ctx);
+        }
+    });
+}
+
+/**
+ * Evaluate an x-with binding list into a plain object suitable for a scope
+ * frame. Each binding's expression is evaluated against the current env, so
+ * every binding sees the same lexical stack (bindings do not observe each
+ * other). Runtime errors surface as ReflowRuntimeError with binding context.
+ *
+ * @param {Array<{ name: string, expr: object }>} bindings
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {object} node
+ * @returns {Record<string, unknown>}
+ */
+function evaluateWithBindings(bindings, env, ctx, node) {
+    /** @type {Record<string, unknown>} */
+    const out = {};
+    for (const { name, expr } of bindings) {
+        out[name] = safeEvaluate(expr, env, ctx, node);
+    }
+    return out;
 }
 
 /**
@@ -458,18 +516,21 @@ function emitHtmlContent(value, ctx, node) {
 
 /**
  * Emit x-include body content: resolve the value to a template name and render
- * that template inline. The included template gets the SAME globals ($) but a
- * FRESH lexical scope (the parent's x-data and loop variables are not visible).
- * Fail-fast (ReflowIncludeError) when: the value is not a string, the template
- * is not registered (not_found), the include depth exceeds the limit
+ * that template inline. The included template gets the SAME globals ($) and,
+ * when x-with is present on the same element, the x-with bindings as the
+ * first `data` frame of its fresh env (reachable as `@name` / `.name`); the
+ * caller's other x-data and loop variables remain out of view. Fail-fast
+ * (ReflowIncludeError) when: the value is not a string, the template is not
+ * registered (not_found), the include depth exceeds the limit
  * (depth_exceeded), or the same template re-enters (cycle).
  *
  * @param {unknown} value
  * @param {import('./scope.js').Env} env
  * @param {object} ctx
  * @param {object} node
+ * @param {Record<string, unknown> | null} [withBindings]
  */
-function emitIncludeContent(value, env, ctx, node) {
+function emitIncludeContent(value, env, ctx, node, withBindings = null) {
     if (typeof value !== 'string') {
         throw makeIncludeError(
             `x-include: value must evaluate to a template name (string), got ${describeValue(value)}`,
@@ -500,7 +561,8 @@ function emitIncludeContent(value, env, ctx, node) {
         );
     }
 
-    // Render with fresh lexical scope, same globals
+    // Render with fresh lexical scope, same globals. x-with bindings, when
+    // present, seed the fresh env as its first data frame.
     const rendered = render({
         name: targetName,
         compiled: target,
@@ -509,6 +571,7 @@ function emitIncludeContent(value, env, ctx, node) {
         templates: ctx.templates,
         maxIncludeDepth: ctx.maxIncludeDepth,
         includeStack: ctx.includeStack,
+        initialBindings: withBindings,
     });
     ctx.out.push(rendered);
 }
@@ -797,14 +860,7 @@ function executeParentIterationsBatched(parent, candidates, env, ctx) {
         walkAndTrackChildrenBatched(candidates, parent, parent.children, env, ctx);
     };
 
-    const withData = (fn) => {
-        if (d.data) {
-            pushFrame(env, 'data', d.data.scopes);
-            try { fn(); } finally { popFrame(env); }
-        } else {
-            fn();
-        }
-    };
+    const withFrames = (fn) => pushOwnFrames(d, env, ctx, parent, fn);
 
     if (d.for) {
         const { varName, start, stop, step: stepVal } = d.for;
@@ -812,7 +868,7 @@ function executeParentIterationsBatched(parent, candidates, env, ctx) {
         for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
             if (state.matches.length >= state.stopAfter) return;
             pushFrame(env, 'loop', { [varName]: i });
-            try { withData(dispatch); } finally { popFrame(env); }
+            try { withFrames(dispatch); } finally { popFrame(env); }
         }
         return;
     }
@@ -830,12 +886,12 @@ function executeParentIterationsBatched(parent, candidates, env, ctx) {
             const frame = { [itemName]: collection[i] };
             if (indexName) frame[indexName] = i;
             pushFrame(env, 'loop', frame);
-            try { withData(dispatch); } finally { popFrame(env); }
+            try { withFrames(dispatch); } finally { popFrame(env); }
         }
         return;
     }
 
-    withData(dispatch);
+    withFrames(dispatch);
 }
 
 /**
@@ -1311,14 +1367,7 @@ function stepControlFlow(step, env, ctx, cont) {
 
     // 2. Iteration on the step element itself.
     const d = step.directives;
-    const withData = (fn) => {
-        if (d.data) {
-            pushFrame(env, 'data', d.data.scopes);
-            try { fn(); } finally { popFrame(env); }
-        } else {
-            fn();
-        }
-    };
+    const withFrames = (fn) => pushOwnFrames(d, env, ctx, step, fn);
 
     if (d.for) {
         const { varName, start, stop, step: stepVal } = d.for;
@@ -1326,7 +1375,7 @@ function stepControlFlow(step, env, ctx, cont) {
         for (let i = start; ascending ? i <= stop : i >= stop; i += stepVal) {
             if (ctx.selectorState.matches.length >= ctx.selectorState.stopAfter) return;
             pushFrame(env, 'loop', { [varName]: i });
-            try { withData(cont); } finally { popFrame(env); }
+            try { withFrames(cont); } finally { popFrame(env); }
         }
         return;
     }
@@ -1344,12 +1393,41 @@ function stepControlFlow(step, env, ctx, cont) {
             const frame = { [itemName]: collection[i] };
             if (indexName) frame[indexName] = i;
             pushFrame(env, 'loop', frame);
-            try { withData(cont); } finally { popFrame(env); }
+            try { withFrames(cont); } finally { popFrame(env); }
         }
         return;
     }
 
-    withData(cont);
+    withFrames(cont);
+}
+
+/**
+ * Push an element's own x-data (if any) then x-with (if any) frames onto the
+ * environment for the duration of `fn`, popping in reverse order afterwards.
+ * Kept out of `stepControlFlow` and `executeParentIterationsBatched` bodies so
+ * the two selector walkers stay in sync when new own-scope directives are
+ * introduced.
+ *
+ * @param {object} d          element's parsed directives
+ * @param {import('./scope.js').Env} env
+ * @param {object} ctx
+ * @param {object} node       the element the directives belong to (for error context)
+ * @param {() => void} fn
+ */
+function pushOwnFrames(d, env, ctx, node, fn) {
+    const hasData = !!d.data;
+    if (hasData) pushFrame(env, 'data', d.data.scopes);
+    let hasWith = false;
+    if (d.with) {
+        pushFrame(env, 'data', evaluateWithBindings(d.with.bindings, env, ctx, node));
+        hasWith = true;
+    }
+    try {
+        fn();
+    } finally {
+        if (hasWith) popFrame(env);
+        if (hasData) popFrame(env);
+    }
 }
 
 /**
@@ -1409,7 +1487,17 @@ function executeIncludeSearch(includeEl, env, ctx) {
     }
 
     // Recurse with the same selector state, fresh lexical scope, same globals.
+    // When the caller's include element carries x-with, seed the fresh env
+    // with those bindings so fragment lookups inside the include reach them
+    // via `@name` / `.name`, mirroring the top-level render() path.
     const nestedEnv = createEnv(env.globals);
+    if (d.with) {
+        pushFrame(
+            nestedEnv,
+            'data',
+            evaluateWithBindings(d.with.bindings, env, ctx, includeEl)
+        );
+    }
     const nestedCtx = {
         ...ctx,
         name: value,

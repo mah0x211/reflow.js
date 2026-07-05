@@ -11,6 +11,7 @@ import { scanElementRanges } from './scanner.js';
 import { makeRoot, makeElement, makeText, makeComment, makeChain, isIgnorableForAdjacency } from './ir.js';
 import {
     parseData,
+    parseWith,
     parseExprValue,
     assertEmptyValue,
     parseFor,
@@ -248,6 +249,15 @@ function processElementAttributes({ node, rawAttrs, prefix, helperNames }) {
                 groups.add('D');
                 break;
             }
+            case 'with': {
+                if (directives.with) throw new Error(`duplicate x-with on element`);
+                directives.with = parseWith(attrValue);
+                for (const b of directives.with.bindings) {
+                    checkHelpers(b.expr, helperNames, attrName);
+                }
+                groups.add('W');
+                break;
+            }
             case 'if': {
                 directives.ifExpr = parseExprValue(attrValue, attrName);
                 checkHelpers(directives.ifExpr, helperNames, attrName);
@@ -339,7 +349,7 @@ function processElementAttributes({ node, rawAttrs, prefix, helperNames }) {
     // Detect K-only invisible marker
     const isKOnly =
         (directives.breakMark || directives.breakIf) &&
-        !(directives.data || directives.ifExpr || directives.elseIfExpr || directives.elseMark ||
+        !(directives.data || directives.with || directives.ifExpr || directives.elseIfExpr || directives.elseMark ||
             directives.matchExpr || directives.caseExpr || directives.nocaseMark ||
             directives.for || directives.each ||
             directives.text || directives.html || directives.include ||
@@ -352,7 +362,7 @@ function processElementAttributes({ node, rawAttrs, prefix, helperNames }) {
 
 /**
  * @param {object} directives
- * @param {Set<'D'|'S'|'I'|'C'|'A'|'K'>} groups
+ * @param {Set<'D'|'W'|'S'|'I'|'C'|'A'|'K'>} groups
  */
 function validateSameElementCombinations(directives, groups) {
     // Within-group exclusivity
@@ -392,6 +402,19 @@ function validateSameElementCombinations(directives, groups) {
     }
     if (groups.has('I') && groups.has('K')) {
         throw new Error(`cannot combine iteration directive with control directive on same element; place x-break / x-break-if on a child`);
+    }
+
+    // x-data and x-with may share an element but must not declare the same
+    // binding name — the resulting shadowing would be silent and confusing.
+    if (directives.data && directives.with) {
+        const dataNames = Object.keys(directives.data.scopes);
+        const withNames = directives.with.bindings.map((b) => b.name);
+        const dataSet = new Set(dataNames);
+        for (const n of withNames) {
+            if (dataSet.has(n)) {
+                throw new Error(`name "${n}" declared by both x-data and x-with on the same element`);
+            }
+        }
     }
 }
 

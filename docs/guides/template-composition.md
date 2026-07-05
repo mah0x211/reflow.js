@@ -31,30 +31,36 @@ const html = reflow.render('layout', {
 </html>
 ```
 
-`x-include="'sidebar'"` is an expression: the string literal `'sidebar'` evaluates to the template name. Any expression that yields a template name works — a global, a helper call, or an `x-data` reference — which is what makes dynamic content areas possible (see below).
+`x-include="'sidebar'"` is an expression: the string literal `'sidebar'` evaluates to the template name. Any expression that yields a template name works — a global, a helper call, or an `@name` reference (from an outer `x-data` / `x-with`) — which is what makes dynamic content areas possible (see below).
 
 ## Scope across include boundaries
 
-Includes are **not** transclusion. The included template renders in its own lexical scope: **globals (`$`) are inherited, but the parent's `x-data`, `x-for`, and `x-each` variables are not**.
+Includes are **not** transclusion. The included template renders in its own lexical scope: **globals (`$`) and any `x-with` bindings on the include element are visible; the parent's other `x-data`, `x-for`, and `x-each` variables are not**.
 
-That means the sidebar sees `$.user`, but if the layout also declares `x-data="site: {...}"`, the sidebar cannot reach `@site` — it must read the value from `$` directly, or declare its own `x-data`.
+That means the sidebar sees `$.user`, but if the layout also declares `x-data="site: {...}"` on some outer element, the sidebar cannot reach `@site` on its own. Either pass it through `x-with` on the `x-include`, or read the value from `$` directly.
 
 ```html
-<!-- layout: exposes @site to itself only -->
+<!-- layout: exposes @site to itself and, via x-with, to the include -->
 <body x-data="site: { name: 'Reflow' }">
   <header>
     <span x-text="@site.name"></span>            <!-- ok -->
   </header>
-  <main x-include="'feed'"></main>               <!-- @site not visible inside feed -->
+  <main x-include="'feed'" x-with="siteName = @site.name"></main>
 </body>
 
-<!-- feed: reaches through globals instead -->
+<!-- feed: reaches @siteName (from x-with) plus $ globals -->
 <section>
-  <h1 x-text="$.siteName"></h1>
+  <h1 x-text="@siteName"></h1>
 </section>
 ```
 
-If you catch yourself wanting to pass complex context in, put it in `$` before rendering. Reflow deliberately draws a hard boundary so that includes are always composable — you never need to know what scopes the parent happens to declare.
+`x-with` on the include is the primary way to pass named context in. When you have several related fields to send, group them into an object literal:
+
+```html
+<main x-include="'feed'" x-with="ctx = { siteName: @site.name, mode: $.mode }"></main>
+```
+
+If you find yourself passing many independent bindings, consider building them once on `$` at `render(...)` time so every include reads from the same shared shape. Reflow deliberately draws a hard boundary so that includes are always composable — you never need to know what scopes the parent happens to declare, only what data the include explicitly received.
 
 ## Dynamic content areas
 

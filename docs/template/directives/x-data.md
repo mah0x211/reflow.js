@@ -66,7 +66,7 @@ Because `x-data` is a JSON5 literal, values from `$` (or from an outer `@name` /
 </div>
 ```
 
-If you specifically want a named handle for something the caller supplies, pass it under a stable key on `$` and refer to it as `$.key` at the use site.
+For a derived value that needs a name and lives on a runtime scope, reach for [`x-with`](./x-with.md) — its RHS is a full expression and it pushes an `@name` frame just like `x-data`.
 
 ### Layering scopes down the tree
 
@@ -88,5 +88,6 @@ If you specifically want a named handle for something the caller supplies, pass 
 
 ## See also
 
+- [`x-with`](./x-with.md) for the runtime-evaluated counterpart (needed when a scope value must be computed from `$` / `@` / helper).
 - [Scope resolution](../scopes.md) for the interaction between `@name`, `.name`, and loop variables.
-- [`x-include`](./x-include.md) for how scopes cross include boundaries (spoiler: they don't; only `$` does).
+- [`x-include`](./x-include.md) for how scopes cross include boundaries (spoiler: they don't; only `$` and `x-with` bindings do).

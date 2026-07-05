@@ -17,14 +17,16 @@ The expression is evaluated at render time. Its result must be a **string** — 
 - The included template renders with:
   - **Same globals (`$`)** — inherited from the caller.
   - **Fresh lexical scope** — the caller's `x-data` scopes and loop variables are **not visible** inside the included template.
+  - **[`x-with`](./x-with.md) bindings on the include element**, if any, seed the included template's fresh env as its first `data` frame, reachable via `@name` / `.name`. This is the supported way to pass named data across the include boundary.
 - The instance's `templates()` map is consulted at render time; if the target is not registered, `ReflowIncludeError { reason: 'not_found' }`.
 - The interpreter tracks an include stack and refuses to re-enter a template already on it (`ReflowIncludeError { reason: 'cycle' }`).
 - Include depth is bounded by `config.maxIncludeDepth` (default 50); exceeding it raises `ReflowIncludeError { reason: 'depth_exceeded' }`.
 
 ## Combinations
 
-- Combines with `x-data`, `x-bind`, structural (`x-if` / `x-match`), and iteration (`x-for` / `x-each`).
+- Combines with `x-data`, `x-with`, `x-bind`, structural (`x-if` / `x-match`), and iteration (`x-for` / `x-each`).
 - Combines with `x-break-if` on a descendant of an iterated element, as usual.
+- `x-with` on the same element passes its bindings into the included template as an initial `data` frame; see [Passing data to an include](#passing-data-to-an-include).
 
 ## Common uses
 
@@ -76,12 +78,29 @@ Everything the panel needs must live on `$` at render time.
 </div>
 ```
 
+### Passing data to an include
+
+Because the included template renders in a fresh lexical scope, the caller's `x-data` scopes and loop variables are not visible inside it. Use [`x-with`](./x-with.md) on the include element to pass named values across the boundary — the bindings become the included template's first `data` frame:
+
+```html
+<!-- caller -->
+<article x-include="'panel'" x-with="title = $.t, body = $.b"></article>
+
+<!-- panel.html -->
+<section>
+  <h2 x-text="@title"></h2>
+  <p x-text="@body"></p>
+</section>
+```
+
+`x-with` values are ordinary expressions, so you can pass anything the expression language can construct — object / array literals, helper results, or a reshaped scope value. See [Composite literals](../expressions.md#composite-literals).
+
 ## Scope boundary
 
-The included template only sees `$`. Two implications:
+The included template only sees `$` plus any `x-with` bindings on the include element. Two implications:
 
-1. If a partial needs context that the caller has as `@site` / `x-each` variable, put it into `$` first (or expose it through a helper).
-2. Partials are always composable — they never depend on what their host template happens to declare.
+1. If a partial needs context that the caller has as `@site` / an `x-each` variable, pass it through `x-with`, put it into `$` first, or expose it through a helper.
+2. Partials are always composable — they never depend on what their host template happens to declare, only on the data explicitly handed to them.
 
 See [Template composition — Scope across include boundaries](../../guides/template-composition.md#scope-across-include-boundaries).
 

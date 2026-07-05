@@ -5,7 +5,8 @@ Reflow directives are HTML attributes with the configured prefix (`x-` by defaul
 ## Index
 
 ### Scope
-- [`x-data`](./x-data.md) — declare one or more named scopes reachable as `@name`.
+- [`x-data`](./x-data.md) — declare one or more named scopes reachable as `@name` (compile-time JSON5 literal).
+- [`x-with`](./x-with.md) — declare one or more named bindings by evaluating expressions at render time; also the way to pass named values across an `x-include` boundary.
 
 ### Content (mutually exclusive on the same element)
 - [`x-text`](./x-text.md) — replace the element's body with an HTML-escaped expression value.
@@ -34,7 +35,7 @@ Enforced at compile time; violations throw `ReflowCompileError`.
 - **Structural + Control** — forbidden. Put the break on a child of the branch.
 - **Iteration + Control** — forbidden. Put the break on a child of the iterated element.
 - **Content directives are mutually exclusive** — at most one of `x-text` / `x-html` / `x-include`.
-- **`x-data` may combine with any directive** and pushes its scope before evaluating the rest.
+- **`x-data` and `x-with` may combine with any directive** and both push their scope before evaluating the rest. When they appear on the same element, `x-data` is pushed first (its bindings are visible to `x-with` expressions on that element), and neither may declare a name the other already declares.
 
 ## Where directives can appear
 

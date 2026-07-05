@@ -25,8 +25,14 @@ import { resolveDot, resolveAt, resolveDollar } from '../scope.js';
  *   c ? t : e       -> JS truthiness of c selects the branch.
  *   name(args)      -> call a REGISTERED helper: helpers[name].apply(null,
  *                      args.map(evaluate)). Arity is not checked.
+ *   { k: v, ... }   -> build a plain object. Entry keys are static literals
+ *                      or [expr] computed; on collision the last write wins
+ *                      (JS object-literal semantics). A computed key whose
+ *                      value evaluates to anything other than a string or a
+ *                      number throws (surfaces as ReflowRuntimeError).
+ *   [ v, ... ]      -> build an array by evaluating each item in order.
  *
- * Disallowed constructs (arithmetic, concatenation, method calls, non-scalar
+ * Disallowed constructs (arithmetic, concatenation, method calls, template
  * literals) never reach the interpreter — they are rejected by the parser.
  *
  * @param {object} node   AST node produced by parseExpression
@@ -102,11 +108,45 @@ export function evaluate(node, env, helpers) {
             return fn.apply(null, args);
         }
 
+        case 'object': {
+            const out = {};
+            for (const { key, value } of node.entries) {
+                let k;
+                if (key.type === 'literal') {
+                    k = key.value;
+                } else {
+                    // computed
+                    const rawKey = evaluate(key.expr, env, helpers);
+                    if (typeof rawKey !== 'string' && typeof rawKey !== 'number') {
+                        throw new Error(
+                            `object literal: computed key must evaluate to a string or number, got ${describeType(rawKey)}`
+                        );
+                    }
+                    k = rawKey;
+                }
+                out[k] = evaluate(value, env, helpers);
+            }
+            return out;
+        }
+
+        case 'array':
+            return node.items.map((item) => evaluate(item, env, helpers));
+
         /* c8 ignore start */
         default:
             throw new Error(`unknown expression node type: ${node.type}`);
         /* c8 ignore stop */
     }
+}
+
+/**
+ * @param {unknown} v
+ * @returns {string}
+ */
+function describeType(v) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    return typeof v;
 }
 
 /**
@@ -138,6 +178,15 @@ export function collectHelperNames(node, out = new Set()) {
             collectHelperNames(node.test, out);
             collectHelperNames(node.consequent, out);
             collectHelperNames(node.alternate, out);
+            break;
+        case 'object':
+            for (const { key, value } of node.entries) {
+                if (key.type === 'computed') collectHelperNames(key.expr, out);
+                collectHelperNames(value, out);
+            }
+            break;
+        case 'array':
+            for (const item of node.items) collectHelperNames(item, out);
             break;
         default:
             break;
